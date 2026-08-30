@@ -13,9 +13,23 @@ async def main():
     received = 0
     bytes_total = 0
 
+    audio_frames = [0]
+
     @pc.on("track")
     def on_track(track):
         print(f"[client] 收到远端 track: {track.kind}")
+        if track.kind == "audio":
+            async def consume_audio():
+                while True:
+                    try:
+                        f = await track.recv()
+                        audio_frames[0] += 1
+                        if audio_frames[0] % 50 == 0:
+                            print(f"[client] 音频帧: {audio_frames[0]}  {f.sample_rate}Hz {f.layout}", flush=True)
+                    except Exception:
+                        break
+            asyncio.ensure_future(consume_audio())
+            return
         async def consume():
             nonlocal received, bytes_total
             t0 = asyncio.get_event_loop().time()
@@ -62,7 +76,7 @@ async def main():
 
     sig_task = asyncio.ensure_future(signaling())
     await asyncio.sleep(DURATION)
-    print(f"[client] 测试结束: 共接收 {received} 帧")
+    print(f"[client] 测试结束: 共接收 {received} 视频帧, {audio_frames[0]} 音频帧")
     await pc.close()
     sig_task.cancel()
 

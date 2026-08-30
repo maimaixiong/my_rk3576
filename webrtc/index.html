@@ -19,12 +19,13 @@
 </head>
 <body>
 <div id="wrap">
-  <h1>RK3576 实时视频（WebRTC / MPP H264 硬编码）</h1>
+  <h1>RK3576 实时视频+音频（WebRTC）</h1>
   <div class="row">
     <button id="btnConn" onclick="toggleConn()">连接</button>
     <span id="status">未连接</span>
   </div>
   <video id="video" autoplay playsinline muted controls></video>
+  <audio id="audio" autoplay controls style="width:100%;margin-top:8px"></audio>
   <div id="info"></div>
 </div>
 
@@ -58,9 +59,14 @@ async function setup() {
       if (e.candidate) send({ type:'ice', candidate: e.candidate.candidate });
     };
     pc.ontrack = e => {
-      video.srcObject = e.streams[0];
-      setStatus('已建立连接，视频流播放中');
-      video.play().catch(()=>{});
+      if (e.track.kind === 'video') {
+        video.srcObject = e.streams[0];
+        setStatus('已建立连接，视频流播放中');
+        video.play().catch(()=>{});
+      } else if (e.track.kind === 'audio') {
+        audio.srcObject = e.streams[0];
+        audio.play().catch(()=>{});
+      }
     };
     pc.onconnectionstatechange = () => {
       setStatus('连接状态: ' + pc.connectionState);
@@ -101,6 +107,7 @@ async function closeAll() {
   if (pc) { pc.close(); pc = null; }
   if (ws) { ws.close(); ws = null; }
   video.srcObject = null;
+  audio.srcObject = null;
   setStatus('已断开');
 }
 

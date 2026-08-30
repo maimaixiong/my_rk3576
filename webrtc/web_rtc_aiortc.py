@@ -20,9 +20,10 @@ import signal
 import functools
 import http.server
 
+import subprocess
 import numpy as np
-from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription, VideoStreamTrack
-from aiortc.mediastreams import VideoFrame
+from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription, VideoStreamTrack, AudioStreamTrack
+from aiortc.mediastreams import VideoFrame, AudioFrame
 import websockets
 from v4l2_cap import V4L2Capture
 
@@ -132,6 +133,52 @@ class CameraTrack(VideoStreamTrack):
         return frame
 
 
+class MicTrack(AudioStreamTrack):
+    """ES8388 麦克风 → Opus（arecord 子进程管道，20ms/帧）"""
+    kind = "audio"
+
+    def __init__(self):
+        super().__init__()
+        self.sample_rate = 48000
+        self.channels = 2
+        self.samples = 960                      # 20ms @ 48kHz
+        self.frame_bytes = self.samples * self.channels * 2
+        self._pts = 0
+        self.proc = subprocess.Popen(
+            ["arecord", "-D", "hw:0,0", "-f", "S16_LE", "-r", "48000",
+             "-c", "2", "-t", "raw", "-q"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def close(self):
+        """释放音频设备（杀 arecord 进程）"""
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                self.proc.kill()
+
+    async def recv(self):
+        try:
+            data = await asyncio.get_event_loop().run_in_executor(
+                None, self.proc.stdout.read, self.frame_bytes)
+        except Exception as e:
+            print(f"[mic] 读取失败: {e}", flush=True)
+            from aiortc.mediastreams import MediaStreamError
+            raise MediaStreamError("麦克风读取失败")
+        if len(data) < self.frame_bytes:
+            from aiortc.mediastreams import MediaStreamError
+            raise MediaStreamError("音频流结束")
+
+        frame = AudioFrame(format="s16", layout="stereo", samples=self.samples)
+        frame.planes[0].update(data)
+        frame.sample_rate = self.sample_rate
+        frame.time_base = fractions.Fraction(1, self.sample_rate)
+        frame.pts = self._pts
+        self._pts += self.samples
+        return frame
+
+
 class RTCServer:
     def __init__(self, http_port=8080):
         self.http_port = http_port
@@ -160,6 +207,12 @@ class RTCServer:
             print("[ws] 浏览器断开")
         finally:
             self.ws = None
+            # 断开时释放设备（供下次连接）
+            if hasattr(self, "mic") and self.mic:
+                try:
+                    self.mic.close()
+                except Exception:
+                    pass
 
     async def handle_join(self):
         """新连接：建 PC + 视频轨 + 发起 offer"""
@@ -168,6 +221,11 @@ class RTCServer:
         if hasattr(self, "cap") and self.cap:
             try:
                 self.cap.close()      # 释放 V4L2 设备（否则下次 join EBUSY）
+            except Exception:
+                pass
+        if hasattr(self, "mic") and self.mic:
+            try:
+                self.mic.close()      # 释放音频设备（否则下次 join 无声音）
             except Exception:
                 pass
 
@@ -200,7 +258,10 @@ class RTCServer:
         self.cap.open()
         self.track = CameraTrack(self.cap)
         self.pc.addTrack(self.track)
-        print(f"[rtc] 摄像头就绪，创建 offer...")
+        # 音频轨（ES8388 麦克风）
+        self.mic = MicTrack()
+        self.pc.addTrack(self.mic)
+        print(f"[rtc] 摄像头+麦克风就绪，创建 offer...")
 
         offer = await self.pc.createOffer()
         # 限制码率：m=video 行加 b=AS（aiortc 解析为 target_bitrate）
