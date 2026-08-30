@@ -22,14 +22,20 @@ import http.server
 
 import ssl
 import subprocess
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
+Gst.init(None)
+import av
 import numpy as np
+import cv2
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription, VideoStreamTrack, AudioStreamTrack
 from aiortc.mediastreams import VideoFrame, AudioFrame
 import websockets
 from v4l2_cap import V4L2Capture
 
 SRC_W, SRC_H = 2688, 1520
-OUT_W, OUT_H = 640, 360   # 输出分辨率（可调；1280x720 时 VP8 软编仅 ~10fps）
+OUT_W, OUT_H = 1280, 720   # 输出分辨率（720p）
 
 PIPE = f"""
 v4l2src device=/dev/video11 !
@@ -43,95 +49,152 @@ class StaticHandler(http.server.SimpleHTTPRequestHandler):
         pass
 
 class CameraTrack(VideoStreamTrack):
-    """V4L2 直读 + numpy 缩放的 WebRTC 视频轨（参考 teleoprtc VideoTrack）"""
+    """V4L2 直读 → 软件缩放/AWB/AE → MPP H264 硬编（后台线程）→ aiortc 发送"""
     kind = "video"
 
     def __init__(self, cap: V4L2Capture):
         super().__init__()
         self.cap = cap
         self._fc = 0
-        self._u_off = None      # AWB 色偏补偿（IIR 平滑）
+        self._u_off = None
         self._v_off = None
-        self._exp = 800         # 软件 AE 当前曝光
+        self._exp = 800
         self._gain = 128
         self._bright = 0
-        # 预计算缩放索引（最近邻）
+        self.q = queue.Queue(maxsize=2)
+
         self._sy = (np.arange(OUT_H) * SRC_H // OUT_H)
         self._sx = (np.arange(OUT_W) * SRC_W // OUT_W)
-        # UV 分离后平面 (H/2, W/2)：行数 OUT_H//2，列数 OUT_W//2（各取一半）
         self._usy = (np.arange(OUT_H // 2) * (SRC_H // 2) // (OUT_H // 2))
         self._usx = (np.arange(OUT_W // 2) * (SRC_W // 2) // (OUT_W // 2))
 
-    def _frame_data(self):
-        """取帧 + NV12→yuv420p 缩放（在 executor 线程执行，释放 GIL）"""
+        # gst MPP 硬编码管道
+        pipe_str = f"""
+appsrc name=src format=time is-live=true max-buffers=4 !
+video/x-raw,format=I420,width={OUT_W},height={OUT_H},framerate=30/1 !
+mpph264enc rc-mode=cbr qp-init=24 profile=main !
+h264parse !
+appsink name=sink sync=false drop=true max-buffers=3
+"""
+        self.pipe = Gst.parse_launch(pipe_str)
+        self.gsrc = self.pipe.get_by_name("src")
+        self.gsink = self.pipe.get_by_name("sink")
+        self.pipe.set_state(Gst.State.PLAYING)
+        print(f"[cam] MPP H264 硬编就绪 {OUT_W}x{OUT_H}", flush=True)
+
+        threading.Thread(target=self._enc_loop, daemon=True).start()
+
+    def _frame_i420(self):
+        """V4L2 抓帧 + cv2 缩放 + AWB → I420 bytes（cv2 释放 GIL）"""
         data = self.cap.grab()
         y = np.frombuffer(data[:SRC_W * SRC_H], np.uint8).reshape(SRC_H, SRC_W)
         uv = np.frombuffer(data[SRC_W * SRC_H:], np.uint8).reshape(SRC_H // 2, SRC_W)
 
-        y_s_arr = y[self._sy][:, self._sx]
-        y_s = y_s_arr.tobytes()
-        # 先分离 U/V 平面（NV12 交错：偶列 U，奇列 V），再分别缩放（修复红绿条纹）
-        u_c = uv[self._usy][:, 0::2][:, self._usx].astype(np.int16) - 128
-        v_c = uv[self._usy][:, 1::2][:, self._usx].astype(np.int16) - 128
+        y_s = cv2.resize(y, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
+        u_s = cv2.resize(uv[:, 0::2], (OUT_W // 2, OUT_H // 2),
+                         interpolation=cv2.INTER_LINEAR)
+        v_s = cv2.resize(uv[:, 1::2], (OUT_W // 2, OUT_H // 2),
+                         interpolation=cv2.INTER_LINEAR)
 
-        # 软件 AE（anti-flicker 50Hz：曝光上限 972 行≈20ms=光源整数周期，之后用增益）
+        # AWB（灰度世界，降采样均值；cv2 加减补偿释放 GIL）
         if self._fc % 5 == 0:
-            self._bright = 0.7 * self._bright + 0.3 * float(y_s_arr.mean())
-            self._ae_adjust()
-
-        # 软件 AWB：灰度世界（每 5 帧更新一次平滑色偏）
-        if self._fc % 5 == 0:
-            u_mean, v_mean = float(u_c.mean()), float(v_c.mean())
+            um = float(u_s[::4, ::4].mean()) - 128.0
+            vm = float(v_s[::4, ::4].mean()) - 128.0
             if self._u_off is None:
-                self._u_off, self._v_off = u_mean, v_mean
+                self._u_off, self._v_off = um, vm
             else:
-                self._u_off = 0.85 * self._u_off + 0.15 * u_mean
-                self._v_off = 0.85 * self._v_off + 0.15 * v_mean
+                self._u_off = 0.85 * self._u_off + 0.15 * um
+                self._v_off = 0.85 * self._v_off + 0.15 * vm
 
-        u_s = np.ascontiguousarray(np.clip(u_c - self._u_off + 128, 0, 255).astype(np.uint8)).tobytes()
-        v_s = np.ascontiguousarray(np.clip(v_c - self._v_off + 128, 0, 255).astype(np.uint8)).tobytes()
-        return y_s, u_s, v_s
+        if abs(self._u_off) > 1:
+            off = int(round(min(abs(self._u_off), 255)))
+            if self._u_off > 0:
+                u_s = cv2.subtract(u_s, off)
+            else:
+                u_s = cv2.add(u_s, off)
+        if abs(self._v_off) > 1:
+            off = int(round(min(abs(self._v_off), 255)))
+            if self._v_off > 0:
+                v_s = cv2.subtract(v_s, off)
+            else:
+                v_s = cv2.add(v_s, off)
+        return y_s.tobytes() + u_s.tobytes() + v_s.tobytes()
 
     def _ae_adjust(self):
-        """曝光/增益闭环，曝光对齐 50Hz 防条纹"""
-        import subprocess
+        import subprocess as _sp
         TARGET, DEAD = 60.0, 5.0
-        EXP_MIN, EXP_MAX50 = 200, 972    # 上限 972≈20ms（50Hz 整数周期）
+        EXP_MIN, EXP_MAX50 = 200, 972
         GAIN_MIN, GAIN_MAX = 128, 1984
         err = TARGET - self._bright
-        if err > DEAD:                     # 暗
+        if err > DEAD:
             if self._exp < EXP_MAX50:
                 self._exp = min(self._exp + 80, EXP_MAX50)
             elif self._gain < GAIN_MAX:
                 self._gain = min(int(self._gain * 1.2), GAIN_MAX)
-        elif err < -DEAD:                  # 亮
+        elif err < -DEAD:
             if self._gain > GAIN_MIN:
                 self._gain = max(int(self._gain / 1.2), GAIN_MIN)
             elif self._exp > EXP_MIN:
                 self._exp = max(self._exp - 80, EXP_MIN)
         try:
-            subprocess.run(["v4l2-ctl", "-d", "/dev/v4l-subdev3",
-                            "--set-ctrl", f"exposure={self._exp},analogue_gain={self._gain}"],
-                           capture_output=True, timeout=2)
+            _sp.run(["v4l2-ctl", "-d", "/dev/v4l-subdev3",
+                     "--set-ctrl", f"exposure={self._exp},analogue_gain={self._gain}"],
+                    capture_output=True, timeout=2)
         except Exception:
             pass
 
-    async def recv(self):
-        try:
-            y, u, v = await asyncio.get_event_loop().run_in_executor(None, self._frame_data)
-        except Exception as e:
-            from aiortc.mediastreams import MediaStreamError
-            print(f"[cam] 取帧失败: {e}", flush=True)
-            raise MediaStreamError("取帧失败")
+    def _enc_loop(self):
+        """后台编码线程：抓帧→缩放→硬编→入队 H264 包"""
+        import time as _t
+        while True:
+            try:
+                i420 = self._frame_i420()
+                if self._fc % 15 == 0:
+                    self._bright = 0.7 * self._bright + 0.3 * float(
+                        np.frombuffer(i420[:OUT_W * OUT_H], np.uint8).mean())
+                    self._ae_adjust()
 
-        frame = VideoFrame(width=OUT_W, height=OUT_H, format="yuv420p")
-        frame.planes[0].update(y)
-        frame.planes[1].update(u)
-        frame.planes[2].update(v)
-        frame.pts = self._fc
-        frame.time_base = fractions.Fraction(1, 30)
+                pts = self._fc * (Gst.SECOND // 30)
+                buf = Gst.Buffer.new_allocate(None, len(i420), None)
+                buf.fill(0, i420)
+                buf.pts = buf.dts = pts
+                buf.duration = Gst.SECOND // 30
+                self.gsrc.emit("push-buffer", buf)
+
+                h264 = None
+                for _ in range(50):
+                    sample = self.gsink.emit("try-pull-sample", 0)
+                    if sample:
+                        b = sample.get_buffer()
+                        ok, mi = b.map(Gst.MapFlags.READ)
+                        h264 = bytes(mi.data)
+                        b.unmap(mi)
+                        break
+                    _t.sleep(0.001)
+
+                if h264:
+                    if self.q.full():
+                        try: self.q.get_nowait()
+                        except queue.Empty: pass
+                    self.q.put(h264)
+                self._fc += 1
+            except Exception as e:
+                print(f"[cam] 编码线程错误: {type(e).__name__}: {e}", flush=True)
+                _t.sleep(0.02)
+
+    async def recv(self):
+        from aiortc.mediastreams import MediaStreamError
+        while True:
+            try:
+                h264 = self.q.get_nowait()
+                break
+            except queue.Empty:
+                await asyncio.sleep(0.002)
+        packet = av.Packet(h264)
+        packet.pts = self._fc
+        packet.time_base = fractions.Fraction(1, 30)
         self._fc += 1
-        return frame
+        return packet
 
 
 class MicTrack(AudioStreamTrack):
@@ -299,13 +362,24 @@ class RTCServer:
         print(f"[rtc] 摄像头+麦克风就绪，创建 offer...")
 
         offer = await self.pc.createOffer()
-        # 限制码率：m=video 行加 b=AS（aiortc 解析为 target_bitrate）
+        # SDP 编辑：只留 H264（删 VP8/97/98），并加码率限制
         lines = offer.sdp.split("\r\n")
         out = []
         for l in lines:
+            # 删 VP8 相关行
+            if ("rtpmap:97 " in l or "rtpmap:98 " in l or "apt=97" in l
+                    or "apt=98" in l or "fmtp:97" in l or "fmtp:98" in l):
+                continue
             out.append(l)
             if l.startswith("m=video"):
-                out.append("b=AS:2500")
+                out.append("b=AS:3000")
+                # m 行只保留 H264 payload（99/100/101/102）
+        # 修正 m=video 行：删 97 98
+        for i, l in enumerate(out):
+            if l.startswith("m=video"):
+                parts = l.split()
+                parts = [p for p in parts if p not in ("97", "98")]
+                out[i] = " ".join(parts)
         offer.sdp = "\r\n".join(out)
         await self.pc.setLocalDescription(offer)
         sdp_send = self.pc.localDescription.sdp   # 候选在 setLocalDescription 后写入这里
