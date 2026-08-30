@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 测试产生的临时文件
+*.nv12
+*.h264
+*.yuv
+*.log
+
+# 编辑器
+.vscode/
+.idea/

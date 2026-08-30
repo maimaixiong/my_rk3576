@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RK3576 远端图像</title>
+<style>
+  body { margin:0; background:#111; color:#ddd; font-family:system-ui,sans-serif; }
+  #wrap { max-width:960px; margin:0 auto; padding:16px; }
+  h1 { font-size:18px; color:#fff; }
+  video { width:100%; background:#000; border-radius:8px; }
+  #status { font-size:13px; margin:8px 0; color:#8f8; }
+  #status.err { color:#f88; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  button { background:#2a6; color:#fff; border:0; padding:8px 16px; border-radius:6px; font-size:14px; cursor:pointer; }
+  button:disabled { background:#555; cursor:default; }
+  #info { font-size:12px; color:#999; margin-top:6px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>RK3576 实时视频（WebRTC / MPP H264 硬编码）</h1>
+  <div class="row">
+    <button id="btnConn" onclick="toggleConn()">连接</button>
+    <span id="status">未连接</span>
+  </div>
+  <video id="video" autoplay playsinline muted controls></video>
+  <div id="info"></div>
+</div>
+
+<script>
+let pc = null, ws = null, connected = false;
+
+const status = document.getElementById('status');
+const video = document.getElementById('video');
+const btn = document.getElementById('btnConn');
+
+function setStatus(text, err=false) {
+  status.textContent = text;
+  status.className = err ? 'err' : '';
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+async function toggleConn() {
+  if (connected) { await closeAll(); return; }
+  await setup();
+}
+
+async function setup() {
+  try {
+    pc = new RTCPeerConnection({ iceServers: [] });   // 局域网直连
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    pc.onicecandidate = e => {
+      if (e.candidate) send({ type:'ice', candidate: e.candidate.candidate });
+    };
+    pc.ontrack = e => {
+      video.srcObject = e.streams[0];
+      setStatus('已建立连接，视频流播放中');
+      video.play().catch(()=>{});
+    };
+    pc.onconnectionstatechange = () => {
+      setStatus('连接状态: ' + pc.connectionState);
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        connected = false; btn.textContent = '连接';
+      }
+    };
+
+    const host = location.hostname || location.host;
+    ws = new WebSocket(`ws://${host}:8081`);
+    ws.onopen = () => { setStatus('信令已连接，等待 offer...'); send({type:'join'}); };
+    ws.onmessage = async ev => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'offer') {
+        setStatus('收到 offer，应答中...');
+        await pc.setRemoteDescription({ type:'offer', sdp: msg.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ type:'answer', sdp: answer.sdp });
+      } else if (msg.type === 'ice') {
+        try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.mlineindex || 0 }); }
+        catch(e) { console.warn('ICE 添加失败', e); }
+      }
+    };
+    ws.onclose = () => { setStatus('信令断开', true); };
+    ws.onerror = () => { setStatus('信令错误', true); };
+
+    connected = true;
+    btn.textContent = '断开';
+    setStatus('等待信令连接...');
+  } catch (e) {
+    setStatus('初始化失败: ' + e.message, true);
+  }
+}
+
+async function closeAll() {
+  connected = false; btn.textContent = '连接';
+  if (pc) { pc.close(); pc = null; }
+  if (ws) { ws.close(); ws = null; }
+  video.srcObject = null;
+  setStatus('已断开');
+}
+
+// 帧率/延迟统计
+let last = performance.now();
+video.addEventListener('timeupdate', () => {
+  const now = performance.now();
+  if (now - last > 1000) {
+    const fps = Math.round(1 / ((now - last)/1000 / Math.max(1, video.webkitDecodedFrames || 0)));
+    last = now;
+  }
+});
+</script>
+</body>
+</html>
