@@ -360,16 +360,16 @@ class RTCServer:
         ctx.load_cert_chain(cert, key)
         return ctx
 
-    async def main(self):
-        ctx = self._ssl_ctx()
-        # HTTPS 静态服务器（页面）
+    async def main(self, use_https=False):
         handler = functools.partial(StaticHandler, directory=self.webroot)
         httpd = http.server.ThreadingHTTPServer(("0.0.0.0", self.http_port), handler)
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        if use_https:
+            ctx = self._ssl_ctx()
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        print(f"[https] 页面服务器 https://0.0.0.0:{self.http_port}")
+        print(f"[{'https' if use_https else 'http'}] 页面服务器 {'https' if use_https else 'http'}://0.0.0.0:{self.http_port}")
 
-        await self.ws_server(ctx)
+        await self.ws_server(self._ssl_ctx() if use_https else None)
 
 
 if __name__ == "__main__":
@@ -384,4 +384,5 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, on_sig)
     signal.signal(signal.SIGTERM, on_sig)
 
-    asyncio.run(srv.main())
+    use_https = "--https" in sys.argv
+    asyncio.run(srv.main(use_https))

@@ -30,7 +30,10 @@ async def main():
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
-    ws = await websockets.connect(f"wss://{SERVER}:8081", ssl=ssl_ctx)
+    # 默认 HTTP/ws；--https 用 wss
+    proto = "wss" if "--https" in sys.argv else "ws"
+    kw = {"ssl": ssl_ctx} if proto == "wss" else {}
+    ws = await websockets.connect(f"{proto}://{SERVER}:8081", **kw)
     pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     received = 0
     bytes_total = 0

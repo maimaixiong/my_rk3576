@@ -85,7 +85,8 @@ async function setup() {
     };
 
     const host = location.hostname || location.host;
-    ws = new WebSocket(`wss://${host}:8081`);
+    const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
+    ws = new WebSocket(`${wsProto}://${host}:8081`);
     ws.onopen = () => { setStatus('信令已连接，等待 offer...'); send({type:'join'}); };
     ws.onmessage = async ev => {
       const msg = JSON.parse(ev.data);
