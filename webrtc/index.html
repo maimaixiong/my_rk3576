@@ -43,6 +43,7 @@
     <div class="meter-label">🔊 浏览器播放电平</div>
     <div class="meter-bar"><div class="meter-fill" id="plfill"></div></div>
   </div>
+  <div id="vidstate" style="font-size:13px;color:#8f8;margin-top:6px">等待视频...</div>
   <div id="audiolvl" style="font-size:13px;color:#fc8;margin-top:6px"></div>
   <div id="info"></div>
 </div>
@@ -87,7 +88,15 @@ async function setup() {
     pc.ontrack = e => {
       if (e.track.kind === 'video') {
         video.srcObject = e.streams[0];
-        setStatus('已建立连接，视频流播放中');
+        video.addEventListener('loadeddata', () => {
+          setStatus('视频已解码: ' + video.videoWidth + 'x' + video.videoHeight);
+          document.getElementById('vidstate').textContent = '✅ 视频解码中 ' + video.videoWidth + 'x' + video.videoHeight;
+        });
+        video.addEventListener('error', () => {
+          document.getElementById('vidstate').textContent = '❌ 视频错误: ' + video.error + ' (' + video.error && video.error.message + ')';
+          setStatus('视频解码错误', true);
+        });
+        setStatus('已建立连接，等待视频解码...');
         video.play().catch(()=>{});
       } else if (e.track.kind === 'audio') {
         audio.srcObject = e.streams[0];

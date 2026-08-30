@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>WebRTC 诊断</title></head>
+<body>
+<h3>WebRTC 浏览器端诊断</h3>
+<pre id="result">测试中...</pre>
+<video id="video" autoplay playsinline muted style="width:400px"></video>
+<script>
+const r = document.getElementById('result');
+const video = document.getElementById('video');
+const log = [];
+function add(s) { log.push(new Date().toISOString().slice(11,19) + ' ' + s); r.textContent = log.join('\n'); }
+
+(async () => {
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [] });
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.oniceconnectionstatechange = () => add('ICE: ' + pc.iceConnectionState);
+    pc.onconnectionstatechange = () => add('PC: ' + pc.connectionState);
+
+    let frameCount = 0;
+    pc.ontrack = e => {
+      add('ontrack: ' + e.track.kind + ' id=' + e.track.id.slice(0,8));
+      video.srcObject = e.streams[0];
+      video.play().catch(err => add('play err: ' + err.message));
+    };
+    video.addEventListener('loadeddata', () => add('loadeddata! size=' + video.videoWidth + 'x' + video.videoHeight));
+    video.addEventListener('playing', () => add('PLAYING! t=' + video.currentTime));
+    video.addEventListener('error', () => add('video error: ' + (video.error ? video.error.message : '?')));
+
+    // 帧检测：video.requestVideoFrameCallback（Chrome 支持）
+    if (video.requestVideoFrameCallback) {
+      const check = () => {
+        frameCount++;
+        add('video frames rendered: ' + frameCount + ' t=' + video.currentTime.toFixed(2));
+        if (frameCount < 3) video.requestVideoFrameCallback(check);
+      };
+      video.requestVideoFrameCallback(check);
+    }
+
+    const ws = new WebSocket('ws://' + location.hostname + ':8081');
+    ws.onopen = () => { add('ws open'); ws.send(JSON.stringify({type:'join'})); };
+    ws.onerror = e => add('ws error');
+    ws.onmessage = async ev => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'offer') {
+        add('offer recv, sdp len=' + msg.sdp.length);
+        await pc.setRemoteDescription({type:'offer', sdp: msg.sdp});
+        const ans = await pc.createAnswer();
+        await pc.setLocalDescription(ans);
+        ws.send(JSON.stringify({type:'answer', sdp: ans.sdp}));
+        add('answer sent');
+      } else if (msg.type === 'ice') {
+        try { await pc.addIceCandidate({candidate: msg.candidate, sdpMLineIndex: msg.mlineindex||0}); }
+        catch(err) { add('ice err: ' + err.message); }
+      }
+    };
+
+    // 8 秒后总结
+    setTimeout(() => {
+      add('=== 8秒总结 ===');
+      add('pcState=' + pc.connectionState + ' iceState=' + pc.iceConnectionState);
+      add('videoReady=' + video.readyState + ' size=' + video.videoWidth + 'x' + video.videoHeight + ' t=' + video.currentTime.toFixed(2));
+      add('RESULT_MARKER');
+    }, 8000);
+  } catch (e) {
+    add('FATAL: ' + e.message);
+    add('RESULT_MARKER');
+  }
+})();
+</script>
+</body>
+</html>

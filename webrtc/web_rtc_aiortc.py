@@ -48,6 +48,12 @@ class StaticHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def end_headers(self):
+        # 禁止缓存（确保浏览器总是加载最新页面）
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        super().end_headers()
+
 class CameraTrack(VideoStreamTrack):
     """V4L2 直读 → 软件缩放/AWB/AE → MPP H264 硬编（后台线程）→ aiortc 发送"""
     kind = "video"
@@ -72,7 +78,7 @@ class CameraTrack(VideoStreamTrack):
         pipe_str = f"""
 appsrc name=src format=time is-live=true max-buffers=4 !
 video/x-raw,format=I420,width={OUT_W},height={OUT_H},framerate=30/1 !
-mpph264enc rc-mode=cbr qp-init=24 profile=main !
+mpph264enc rc-mode=cbr qp-init=24 profile=baseline level=31 gop=30 header-mode=each-idr !
 h264parse !
 appsink name=sink sync=false drop=true max-buffers=3
 """
@@ -228,6 +234,11 @@ appsink name=sink sync=false drop=true max-buffers=3
 
     async def recv(self):
         from aiortc.mediastreams import MediaStreamError
+        if not hasattr(self, "_sent"):
+            self._sent = 0
+        self._sent += 1
+        if self._sent % 120 == 0:
+            print(f"[cam] 已发送 {self._sent} 帧 (RTP)", flush=True)
         while True:
             try:
                 h264 = self.q.get_nowait()
