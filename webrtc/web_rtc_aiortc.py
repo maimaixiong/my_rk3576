@@ -172,13 +172,13 @@ class MicTrack(AudioStreamTrack):
             from aiortc.mediastreams import MediaStreamError
             raise MediaStreamError("音频流结束")
 
-        # 音频电平检测（每 25 帧 ~500ms 一次，无信号时提示）
-        if self._pts % (self.samples * 25) == 0:
+        # 音频电平检测（每 5 帧 ~100ms，实时声压）
+        if self._pts % (self.samples * 5) == 0:
             import numpy as _np
-            rms = _np.sqrt(_np.mean(
-                _np.frombuffer(data, _np.int16).astype(_np.float64) ** 2))
+            rms = float(_np.sqrt(_np.mean(
+                _np.frombuffer(data, _np.int16).astype(_np.float64) ** 2)))
             if self.on_level:
-                self.on_level(float(rms))
+                self.on_level(rms)
 
         frame = AudioFrame(format="s16", layout="stereo", samples=self.samples)
         frame.planes[0].update(data)
@@ -326,13 +326,14 @@ class RTCServer:
             print("[rtc] 已添加远端 ICE")
 
     def _audio_level(self, rms):
-        """音频电平回调：推给浏览器显示"""
-        level = min(int(rms / 100), 10)
+        """声压回调：RMS → dBFS，推给浏览器显示"""
+        import math
+        db = 20 * math.log10(max(rms, 0.5) / 32768.0)
         if rms < 5:
-            print(f"[mic] ⚠️ 麦克风无信号 (RMS={rms:.1f}) — 请确认外接麦克风", flush=True)
+            print(f"[mic] ⚠️ 麦克风无信号 (RMS={rms:.1f}, {db:.0f}dB) — 请确认外接麦克风", flush=True)
         elif self.ws:
             asyncio.run_coroutine_threadsafe(
-                self._send({"type": "audio_level", "level": level}),
+                self._send({"type": "audio_meter", "db": round(db, 1), "rms": round(rms, 1)}),
                 asyncio.get_event_loop())
 
     async def _send(self, msg):
