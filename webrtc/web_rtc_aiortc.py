@@ -82,7 +82,21 @@ appsink name=sink sync=false drop=true max-buffers=3
         self.pipe.set_state(Gst.State.PLAYING)
         print(f"[cam] MPP H264 硬编就绪 {OUT_W}x{OUT_H}", flush=True)
 
+        self._fail_count = 0
+        self._stop = False
         threading.Thread(target=self._enc_loop, daemon=True).start()
+
+    def close(self):
+        """停止编码线程并释放资源（连接断开/重建时）"""
+        self._stop = True
+        try:
+            self.pipe.set_state(Gst.State.NULL)
+        except Exception:
+            pass
+        try:
+            self.cap.close()
+        except Exception:
+            pass
 
     def _frame_i420(self):
         """V4L2 抓帧 + cv2 缩放 + AWB → I420 bytes（cv2 释放 GIL）"""
@@ -143,10 +157,27 @@ appsink name=sink sync=false drop=true max-buffers=3
         except Exception:
             pass
 
+    def _reinit(self):
+        """重建 V4L2 采集 + gst 硬编管道（流中断恢复）"""
+        import time as _t
+        try:
+            self.pipe.set_state(Gst.State.NULL)
+        except Exception:
+            pass
+        try:
+            self.cap.close()
+        except Exception:
+            pass
+        _t.sleep(0.5)
+        self.cap = V4L2Capture()
+        self.cap.open()
+        self.pipe.set_state(Gst.State.PLAYING)
+        _t.sleep(0.3)
+
     def _enc_loop(self):
         """后台编码线程：抓帧→缩放→硬编→入队 H264 包"""
         import time as _t
-        while True:
+        while not self._stop:
             try:
                 i420 = self._frame_i420()
                 if self._fc % 15 == 0:
@@ -178,8 +209,21 @@ appsink name=sink sync=false drop=true max-buffers=3
                         except queue.Empty: pass
                     self.q.put(h264)
                 self._fc += 1
+                self._fail_count = 0
             except Exception as e:
-                print(f"[cam] 编码线程错误: {type(e).__name__}: {e}", flush=True)
+                if self._stop:
+                    return                      # 已关闭，退出线程
+                self._fail_count += 1
+                if self._fail_count % 5 == 0:
+                    print(f"[cam] 编码线程错误: {type(e).__name__}: {e} (连续 {self._fail_count})", flush=True)
+                if self._fail_count >= 10:      # 连续失败 ~200ms → 重建视频链路
+                    print("[cam] ⚠️ 视频链路重建...", flush=True)
+                    try:
+                        self._reinit()
+                        print("[cam] ✅ 视频链路已恢复", flush=True)
+                    except Exception as e2:
+                        print(f"[cam] 重建失败: {e2}", flush=True)
+                    self._fail_count = 0
                 _t.sleep(0.02)
 
     async def recv(self):
@@ -281,6 +325,11 @@ class RTCServer:
         finally:
             self.ws = None
             # 断开时释放设备（供下次连接）
+            if hasattr(self, "track") and self.track:
+                try:
+                    self.track.close()
+                except Exception:
+                    pass
             if hasattr(self, "mic") and self.mic:
                 try:
                     self.mic.close()
@@ -291,9 +340,9 @@ class RTCServer:
         """新连接：建 PC + 视频轨 + 发起 offer"""
         if self.pc:
             await self.pc.close()
-        if hasattr(self, "cap") and self.cap:
+        if hasattr(self, "track") and self.track:
             try:
-                self.cap.close()      # 释放 V4L2 设备（否则下次 join EBUSY）
+                self.track.close()    # 停旧编码线程 + 释放 V4L2
             except Exception:
                 pass
         if hasattr(self, "mic") and self.mic:
