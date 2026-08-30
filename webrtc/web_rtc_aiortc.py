@@ -137,13 +137,14 @@ class MicTrack(AudioStreamTrack):
     """ES8388 麦克风 → Opus（arecord 子进程管道，20ms/帧）"""
     kind = "audio"
 
-    def __init__(self):
+    def __init__(self, on_level=None):
         super().__init__()
         self.sample_rate = 48000
         self.channels = 2
         self.samples = 960                      # 20ms @ 48kHz
         self.frame_bytes = self.samples * self.channels * 2
         self._pts = 0
+        self.on_level = on_level
         self.proc = subprocess.Popen(
             ["arecord", "-D", "hw:0,0", "-f", "S16_LE", "-r", "48000",
              "-c", "2", "-t", "raw", "-q"],
@@ -169,6 +170,14 @@ class MicTrack(AudioStreamTrack):
         if len(data) < self.frame_bytes:
             from aiortc.mediastreams import MediaStreamError
             raise MediaStreamError("音频流结束")
+
+        # 音频电平检测（每 25 帧 ~500ms 一次，无信号时提示）
+        if self._pts % (self.samples * 25) == 0:
+            import numpy as _np
+            rms = _np.sqrt(_np.mean(
+                _np.frombuffer(data, _np.int16).astype(_np.float64) ** 2))
+            if self.on_level:
+                self.on_level(float(rms))
 
         frame = AudioFrame(format="s16", layout="stereo", samples=self.samples)
         frame.planes[0].update(data)
@@ -258,8 +267,8 @@ class RTCServer:
         self.cap.open()
         self.track = CameraTrack(self.cap)
         self.pc.addTrack(self.track)
-        # 音频轨（ES8388 麦克风）
-        self.mic = MicTrack()
+        # 音频轨（ES8388 麦克风），带电平检测回调
+        self.mic = MicTrack(on_level=self._audio_level)
         self.pc.addTrack(self.mic)
         print(f"[rtc] 摄像头+麦克风就绪，创建 offer...")
 
@@ -289,6 +298,16 @@ class RTCServer:
             cand = RTCIceCandidate(candidate=candidate, sdpMid="0", sdpMLineIndex=mlineindex)
             await self.pc.addIceCandidate(cand)
             print("[rtc] 已添加远端 ICE")
+
+    def _audio_level(self, rms):
+        """音频电平回调：推给浏览器显示"""
+        level = min(int(rms / 100), 10)
+        if rms < 5:
+            print(f"[mic] ⚠️ 麦克风无信号 (RMS={rms:.1f}) — 请确认外接麦克风", flush=True)
+        elif self.ws:
+            asyncio.run_coroutine_threadsafe(
+                self._send({"type": "audio_level", "level": level}),
+                asyncio.get_event_loop())
 
     async def _send(self, msg):
         if self.ws:
