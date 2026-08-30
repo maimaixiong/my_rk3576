@@ -20,6 +20,7 @@ import signal
 import functools
 import http.server
 
+import ssl
 import subprocess
 import numpy as np
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription, VideoStreamTrack, AudioStreamTrack
@@ -259,8 +260,33 @@ class RTCServer:
             print(f"[rtc] 连接状态: {self.pc.connectionState}")
 
         @self.pc.on("track")
-        def on_track(track):
-            print(f"[rtc] 远端 track: {track.kind}（忽略）")
+        async def on_track(track):
+            print(f"[rtc] 远端 track: {track.kind}")
+            if track.kind == "audio":
+                # 浏览器 → 板子：播放到 ES8388 喇叭（双向对讲）
+                import subprocess as _sp
+                self._aplay = _sp.Popen(
+                    ["aplay", "-D", "hw:0,0", "-f", "S16_LE", "-r", "48000",
+                     "-c", "2", "-t", "raw", "-q"],
+                    stdin=_sp.PIPE, stderr=_sp.DEVNULL)
+                while True:
+                    try:
+                        f = await track.recv()
+                        arr = f.to_ndarray()          # (channels, samples) int16
+                        if f.layout == "stereo" and arr.shape[0] == 2:
+                            data = arr.T.tobytes()    # 交错
+                        else:
+                            mono = arr[0]
+                            import numpy as _np
+                            data = _np.repeat(mono, 2).tobytes()
+                        self._aplay.stdin.write(data)
+                    except Exception as e:
+                        print(f"[rtc] 远端音频结束: {e}", flush=True)
+                        try:
+                            self._aplay.stdin.close()
+                        except Exception:
+                            pass
+                        break
 
         # 视频轨：V4L2 直读（30fps，比 gst v4l2src 快 3 倍）
         self.cap = V4L2Capture()
@@ -316,20 +342,34 @@ class RTCServer:
             except Exception as e:
                 print(f"[ws] 发送失败: {e}")
 
-    async def ws_server(self):
-        async with websockets.serve(self.ws_handler, "0.0.0.0", self.ws_port):
-            print(f"[ws] 信令服务器 0.0.0.0:{self.ws_port}")
+    async def ws_server(self, ssl_ctx=None):
+        async with websockets.serve(self.ws_handler, "0.0.0.0", self.ws_port, ssl=ssl_ctx):
+            print(f"[wss] 信令服务器 0.0.0.0:{self.ws_port}")
             await asyncio.Future()
 
     # ---------- 主入口 ----------
+    def _ssl_ctx(self):
+        """自签证书（浏览器首次访问需点'继续访问'）"""
+        cert = os.path.join(self.webroot, "cert.pem")
+        key = os.path.join(self.webroot, "key.pem")
+        if not (os.path.exists(cert) and os.path.exists(key)):
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                            "-keyout", key, "-out", cert, "-days", "365", "-nodes",
+                            "-subj", "/CN=192.168.2.100"], capture_output=True)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        return ctx
+
     async def main(self):
-        # HTTP 静态服务器（页面）
+        ctx = self._ssl_ctx()
+        # HTTPS 静态服务器（页面）
         handler = functools.partial(StaticHandler, directory=self.webroot)
         httpd = http.server.ThreadingHTTPServer(("0.0.0.0", self.http_port), handler)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        print(f"[http] 页面服务器 http://0.0.0.0:{self.http_port}")
+        print(f"[https] 页面服务器 https://0.0.0.0:{self.http_port}")
 
-        await self.ws_server()
+        await self.ws_server(ctx)
 
 
 if __name__ == "__main__":

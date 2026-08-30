@@ -1,14 +1,36 @@
 #!/usr/bin/env python3
 """mac 端 WebRTC 接收测试客户端（模拟 teleoprtc Client）"""
-import asyncio, json, sys
-from aiortc import RTCPeerConnection, RTCConfiguration, RTCSessionDescription, RTCIceCandidate
+import asyncio, json, sys, ssl
+import numpy as np
+from aiortc import RTCPeerConnection, RTCConfiguration, RTCSessionDescription, RTCIceCandidate, AudioStreamTrack
+from aiortc.mediastreams import AudioFrame
 import websockets
 
 SERVER = sys.argv[1] if len(sys.argv) > 1 else "192.168.2.100"
 DURATION = int(sys.argv[2]) if len(sys.argv) > 2 else 20
 
+class SineTrack(AudioStreamTrack):
+    """1kHz 测试音（验证 浏览器→板子 对讲链路）"""
+    kind = "audio"
+    def __init__(self):
+        super().__init__()
+        self.sr, self.samples = 48000, 960
+        self._pts = 0
+    async def recv(self):
+        data = (np.sin(2 * np.pi * 1000 * np.arange(self.samples) / self.sr +
+                       self._pts * 2 * np.pi * 1000 / self.sr) * 8000).astype(np.int16)
+        f = AudioFrame(format="s16", layout="mono", samples=self.samples)
+        f.planes[0].update(data.tobytes())
+        f.sample_rate, f.time_base = self.sr, asyncio.get_event_loop().time() and __import__('fractions').Fraction(1, self.sr)
+        f.pts = self._pts
+        self._pts += self.samples
+        return f
+
 async def main():
-    ws = await websockets.connect(f"ws://{SERVER}:8081")
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    ws = await websockets.connect(f"wss://{SERVER}:8081", ssl=ssl_ctx)
     pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     received = 0
     bytes_total = 0
@@ -53,6 +75,10 @@ async def main():
     @pc.on("connectionstatechange")
     def on_state():
         print(f"[client] 连接状态: {pc.connectionState}")
+
+    # 发送 1kHz 测试音（板子喇叭会响，验证双向链路）
+    pc.addTrack(SineTrack())
+    print("[client] 发送 1kHz 测试音到板子...", flush=True)
 
     await ws.send(json.dumps({"type": "join"}))
 

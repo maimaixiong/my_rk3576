@@ -55,6 +55,14 @@ async function setup() {
   try {
     pc = new RTCPeerConnection({ iceServers: [] });   // 局域网直连
     pc.addTransceiver('video', { direction: 'recvonly' });
+    // 双向音频：浏览器麦克风 → 板子喇叭（需 https，本页已启用）
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStream.getAudioTracks().forEach(t => pc.addTrack(t));
+      document.getElementById('audiolvl').textContent = '🎤 已连接本机麦克风（对讲模式）';
+    } catch (e) {
+      document.getElementById('audiolvl').textContent = '⚠️ 无法访问本机麦克风: ' + e.message;
+    }
 
     pc.onicecandidate = e => {
       if (e.candidate) send({ type:'ice', candidate: e.candidate.candidate });
@@ -77,7 +85,7 @@ async function setup() {
     };
 
     const host = location.hostname || location.host;
-    ws = new WebSocket(`ws://${host}:8081`);
+    ws = new WebSocket(`wss://${host}:8081`);
     ws.onopen = () => { setStatus('信令已连接，等待 offer...'); send({type:'join'}); };
     ws.onmessage = async ev => {
       const msg = JSON.parse(ev.data);
