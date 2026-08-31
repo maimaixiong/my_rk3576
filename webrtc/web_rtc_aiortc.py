@@ -29,6 +29,17 @@ Gst.init(None)
 import av
 import numpy as np
 import cv2
+import json as _json
+from yolo_detect import YoloDetector
+
+# ===== 鱼眼去畸变参数（可调；用 cv2.fisheye 模型） =====
+# 通过 PUT /fisheye.json 或直接改这里调整
+FISHEYE = {
+    "enabled": True,
+    "fx": 1000.0, "fy": 1000.0,      # 焦距（越大越"拉平"）
+    "cx": 1267.0, "cy": 807.0,       # 鱼眼圆中心
+    "k1": -0.08, "k2": 0.02, "k3": -0.005, "k4": 0.001,  # 畸变系数（鱼眼模型）
+}
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription, VideoStreamTrack, AudioStreamTrack
 from aiortc.mediastreams import VideoFrame, AudioFrame
 import websockets
@@ -74,6 +85,30 @@ class CameraTrack(VideoStreamTrack):
         self._usy = (np.arange(OUT_H // 2) * (SRC_H // 2) // (OUT_H // 2))
         self._usx = (np.arange(OUT_W // 2) * (SRC_W // 2) // (OUT_W // 2))
 
+        # 鱼眼去畸变 remap 表（预计算，运行时 cv2.remap 一次）
+        self._map_y, self._map_uv = self._build_fisheye_maps()
+        self._init_hw_pipeline()
+        self._start_enc_thread()
+
+    def _build_fisheye_maps(self):
+        if not FISHEYE.get("enabled"):
+            return None, None
+        K = np.array([[FISHEYE["fx"], 0, FISHEYE["cx"]],
+                      [0, FISHEYE["fy"], FISHEYE["cy"]],
+                      [0, 0, 1]], np.float32)
+        D = np.array([FISHEYE["k1"], FISHEYE["k2"], FISHEYE["k3"], FISHEYE["k4"]], np.float32)
+        map_y = cv2.fisheye.initUndistortRectifyMap(
+            K, D, np.eye(3), K, (OUT_W, OUT_H), cv2.CV_32FC1)
+        # UV 平面是半分辨率，K 按比例缩放
+        K_uv = K.copy()
+        K_uv[0, 0] /= 2; K_uv[1, 1] /= 2
+        K_uv[0, 2] /= 2; K_uv[1, 2] /= 2
+        map_uv = cv2.fisheye.initUndistortRectifyMap(
+            K_uv, D, np.eye(3), K_uv, (OUT_W // 2, OUT_H // 2), cv2.CV_32FC1)
+        print(f"[cam] 鱼眼去畸变已启用 (fx={FISHEYE['fx']:.0f} cx={FISHEYE['cx']:.0f} cy={FISHEYE['cy']:.0f})", flush=True)
+        return map_y, map_uv
+
+    def _init_hw_pipeline(self):
         # gst MPP 硬编码管道
         pipe_str = f"""
 appsrc name=src format=time is-live=true max-buffers=4 !
@@ -88,8 +123,10 @@ appsink name=sink sync=false drop=true max-buffers=3
         self.pipe.set_state(Gst.State.PLAYING)
         print(f"[cam] MPP H264 硬编就绪 {OUT_W}x{OUT_H}", flush=True)
 
+    def _start_enc_thread(self):
         self._fail_count = 0
         self._stop = False
+        self.detect_q = queue.Queue(maxsize=1)   # YOLO 检测帧队列
         threading.Thread(target=self._enc_loop, daemon=True).start()
 
     def close(self):
@@ -110,11 +147,19 @@ appsink name=sink sync=false drop=true max-buffers=3
         y = np.frombuffer(data[:SRC_W * SRC_H], np.uint8).reshape(SRC_H, SRC_W)
         uv = np.frombuffer(data[SRC_W * SRC_H:], np.uint8).reshape(SRC_H // 2, SRC_W)
 
-        y_s = cv2.resize(y, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
-        u_s = cv2.resize(uv[:, 0::2], (OUT_W // 2, OUT_H // 2),
-                         interpolation=cv2.INTER_LINEAR)
-        v_s = cv2.resize(uv[:, 1::2], (OUT_W // 2, OUT_H // 2),
-                         interpolation=cv2.INTER_LINEAR)
+        if self._map_y is not None:
+            # 鱼眼去畸变 + 缩放（一次 remap）
+            y_s = cv2.remap(y, self._map_y[0], self._map_y[1], cv2.INTER_LINEAR)
+            u_p = uv[:, 0::2]
+            v_p = uv[:, 1::2]
+            u_s = cv2.remap(u_p, self._map_uv[0], self._map_uv[1], cv2.INTER_LINEAR)
+            v_s = cv2.remap(v_p, self._map_uv[0], self._map_uv[1], cv2.INTER_LINEAR)
+        else:
+            y_s = cv2.resize(y, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
+            u_s = cv2.resize(uv[:, 0::2], (OUT_W // 2, OUT_H // 2),
+                             interpolation=cv2.INTER_LINEAR)
+            v_s = cv2.resize(uv[:, 1::2], (OUT_W // 2, OUT_H // 2),
+                             interpolation=cv2.INTER_LINEAR)
 
         # AWB（灰度世界，降采样均值；cv2 加减补偿释放 GIL）
         if self._fc % 5 == 0:
@@ -214,6 +259,12 @@ appsink name=sink sync=false drop=true max-buffers=3
                         try: self.q.get_nowait()
                         except queue.Empty: pass
                     self.q.put(h264)
+                # 每 5 帧放一帧到检测队列（I420 720p）
+                if self._fc % 5 == 0:
+                    if self.detect_q.full():
+                        try: self.detect_q.get_nowait()
+                        except queue.Empty: pass
+                    self.detect_q.put(i420)
                 self._fc += 1
                 self._fail_count = 0
             except Exception as e:
@@ -315,6 +366,8 @@ class RTCServer:
         self.pc = None
         self.ws = None
         self.loop = None
+        self.detector = None
+        self.det_thread = None
 
     # ---------- aiortc 信令 ----------
     async def ws_handler(self, websocket):
@@ -365,8 +418,6 @@ class RTCServer:
         # 局域网直连：禁用 STUN（板子 UDP 出网不通，避免 gather 卡 Google STUN 超时）
         self.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
 
-        self.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-
         @self.pc.on("icegatheringstatechange")
         async def on_gather():
             print(f"[rtc] ICE gather 状态: {self.pc.iceGatheringState}")
@@ -412,10 +463,20 @@ class RTCServer:
                         break
 
         # 视频轨：V4L2 直读（30fps，比 gst v4l2src 快 3 倍）
-        self.cap = V4L2Capture()
-        self.cap.open()
+        try:
+            self.cap = V4L2Capture()
+            self.cap.open()
+        except Exception as e:
+            print(f"[rtc] 摄像头打开失败: {e}", flush=True)
+            raise
         self.track = CameraTrack(self.cap)
         self.pc.addTrack(self.track)
+        # 启动 YOLO 检测线程（detector 在线程内延迟初始化，不阻塞 offer）
+        # 启动 YOLO 检测线程（detector 在线程内延迟初始化，不阻塞 offer）
+        if self.det_thread is None or not self.det_thread.is_alive():
+            self.det_thread = threading.Thread(target=self._detect_loop, daemon=True)
+            self.det_thread.start()
+            print("[yolo] 检测线程已启动", flush=True)
         # 音频轨（ES8388 麦克风），带电平检测回调
         self.mic = MicTrack(on_level=self._audio_level)
         self.pc.addTrack(self.mic)
@@ -468,6 +529,46 @@ class RTCServer:
             else:
                 print(f"[rtc] 跳过异常 ICE: {str(candidate)[:60]}")
 
+    def _detect_loop(self):
+        """YOLO 检测循环：从队列拿帧 → 检测 → WS 发送结果"""
+        import time as _t
+        # 线程内初始化（30MB 模型加载 ~1s，不阻塞主流程）
+        try:
+            self.detector = YoloDetector(
+                os.path.join(self.webroot, "yolov8s_airborne.rknn"))
+            print("[yolo] 检测器就绪", flush=True)
+        except Exception as e:
+            print(f"[yolo] 检测器初始化失败: {e}", flush=True)
+            self.detector = None
+        while True:
+            try:
+                q = getattr(self.track, "detect_q", None)
+                if q is None:
+                    import time as _tw
+                    _tw.sleep(0.2)
+                    continue
+                i420 = q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                # I420 → BGR
+                img = cv2.cvtColor(
+                    np.frombuffer(i420, np.uint8).reshape(
+                        OUT_H * 3 // 2, OUT_W),
+                    cv2.COLOR_YUV2BGR_I420)
+                t0 = _t.time()
+                objs = self.detector.detect(img)
+                det_ms = int((_t.time() - t0) * 1000)
+                if objs:
+                    print(f"[yolo] {len(objs)} 个目标 ({det_ms}ms): " +
+                          ", ".join(f"{o['label']}:{o['conf']}" for o in objs[:4]), flush=True)
+                if self.ws and self.loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self._send({"type": "detect", "objects": objs}),
+                        self.loop)
+            except Exception as e:
+                print(f"[yolo] 检测错误: {e}", flush=True)
+
     def _audio_level(self, rms):
         """声压回调：RMS → dBFS，推给浏览器显示"""
         import math
@@ -487,6 +588,7 @@ class RTCServer:
                 print(f"[ws] 发送失败: {e}")
 
     async def ws_server(self, ssl_ctx=None):
+        self.loop = asyncio.get_event_loop()   # 供其他线程 WS 发送
         async with websockets.serve(self.ws_handler, "0.0.0.0", self.ws_port, ssl=ssl_ctx):
             print(f"[wss] 信令服务器 0.0.0.0:{self.ws_port}")
             await asyncio.Future()
@@ -522,9 +624,7 @@ if __name__ == "__main__":
 
     def on_sig(signum, frame):
         print("\n[rtc] 退出...")
-        if srv.pc:
-            asyncio.run(srv.pc.close())
-        sys.exit(0)
+        sys.exit(0)   # daemon 线程随进程退出
     signal.signal(signal.SIGINT, on_sig)
     signal.signal(signal.SIGTERM, on_sig)
 
