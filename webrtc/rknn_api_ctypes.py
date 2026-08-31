@@ -111,8 +111,8 @@ class RKNN:
 
     def inference(self, input_data):
         """
-        input_data: numpy uint8 array (与模型输入一致，如 640x640x3 NHWC)
-        返回: numpy float32 数组（want_float）
+        input_data: numpy uint8 array (与模型输入一致)
+        返回: 单输出时 numpy float32 数组；多输出时 list[numpy float32]
         """
         if input_data.dtype != np.uint8:
             input_data = input_data.astype(np.uint8)
@@ -131,22 +131,43 @@ class RKNN:
         if self.lib.rknn_run(self.ctx, None) != 0:
             raise RuntimeError("rknn_run 失败")
 
-        out = RknnOutput()
-        out.want_float = 1
-        out.is_prealloc = 0
-        out.index = 0
-        out.size = self.output_attr.size
-        if self.lib.rknn_outputs_get(self.ctx, 1, ctypes.byref(out), None) != 0:
+        # 查询输出数量
+        num = RknnInputOutputNum()
+        self.lib.rknn_query(self.ctx, RKNN_QUERY_IN_OUT_NUM,
+                            ctypes.byref(num), ctypes.sizeof(num))
+        n_out = num.n_output
+
+        # 查询各输出属性（shape/size）
+        attrs = []
+        for i in range(n_out):
+            attr = RknnTensorAttr()
+            attr.index = i
+            self.lib.rknn_query(self.ctx, RKNN_QUERY_OUTPUT_ATTR,
+                                ctypes.byref(attr), ctypes.sizeof(attr))
+            attrs.append(attr)
+
+        # 一次获取所有输出（数组方式）
+        outs = (RknnOutput * n_out)()
+        for i in range(n_out):
+            outs[i].want_float = 1
+            outs[i].is_prealloc = 0
+            outs[i].index = i
+            outs[i].size = attrs[i].size
+        if self.lib.rknn_outputs_get(self.ctx, n_out, outs, None) != 0:
             raise RuntimeError("rknn_outputs_get 失败")
 
-        addr = out.buf if isinstance(out.buf, int) else 0
-        if not addr:
-            raise RuntimeError("输出缓冲区无效")
-        result = np.ctypeslib.as_array(
-            (ctypes.c_float * self.output_attr.n_elems).from_address(addr))
-        result = result.copy()
-        self.lib.rknn_outputs_release(self.ctx, 1, ctypes.byref(out))
-        return result
+        results = []
+        for i in range(n_out):
+            addr = outs[i].buf if isinstance(outs[i].buf, int) else 0
+            if not addr:
+                raise RuntimeError(f"输出 {i} 缓冲区无效")
+            arr = np.ctypeslib.as_array(
+                (ctypes.c_float * attrs[i].n_elems).from_address(addr)).copy()
+            dims = [attrs[i].dims[j] for j in range(attrs[i].n_dims)]
+            results.append(arr.reshape(dims))
+
+        self.lib.rknn_outputs_release(self.ctx, n_out, outs)
+        return results if n_out > 1 else results[0]
 
     def __del__(self):
         try:

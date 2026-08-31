@@ -535,7 +535,7 @@ class RTCServer:
         # 线程内初始化（30MB 模型加载 ~1s，不阻塞主流程）
         try:
             self.detector = YoloDetector(
-                os.path.join(self.webroot, "yolov8s_airborne.rknn"))
+                os.path.join(self.webroot, "yolov8n_coco.rknn"))
             print("[yolo] 检测器就绪", flush=True)
         except Exception as e:
             print(f"[yolo] 检测器初始化失败: {e}", flush=True)
