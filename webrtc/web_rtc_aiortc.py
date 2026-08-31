@@ -455,9 +455,18 @@ class RTCServer:
     async def handle_ice(self, candidate, mlineindex):
         if self.pc and candidate:
             from aiortc import RTCIceCandidate
-            cand = RTCIceCandidate(candidate=candidate, sdpMid="0", sdpMLineIndex=mlineindex)
-            await self.pc.addIceCandidate(cand)
-            print("[rtc] 已添加远端 ICE")
+            parts = candidate.split()
+            if len(parts) >= 8 and parts[0].startswith("candidate"):
+                cand = RTCIceCandidate(
+                    foundation=parts[0].split(":", 1)[1],
+                    component=int(parts[1]),
+                    protocol=parts[2], priority=int(parts[3]),
+                    ip=parts[4], port=int(parts[5]),
+                    type=parts[7], sdpMid="0", sdpMLineIndex=mlineindex)
+                await self.pc.addIceCandidate(cand)
+                print("[rtc] 已添加远端 ICE")
+            else:
+                print(f"[rtc] 跳过异常 ICE: {str(candidate)[:60]}")
 
     def _audio_level(self, rms):
         """声压回调：RMS → dBFS，推给浏览器显示"""

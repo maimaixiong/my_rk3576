@@ -97,11 +97,19 @@ async def main():
                 await ws.send(json.dumps({"type": "answer", "sdp": pc.localDescription.sdp}))
                 print("[client] 已发送 answer")
             elif t == "ice":
-                cand = RTCIceCandidate(candidate=msg["candidate"], sdpMid="0", sdpMLineIndex=msg.get("mlineindex", 0))
-                try:
-                    await pc.addIceCandidate(cand)
-                except Exception as e:
-                    print(f"[client] ICE 添加失败: {e}")
+                parts = msg["candidate"].split()
+                if len(parts) >= 8 and parts[0].startswith("candidate"):
+                    cand = RTCIceCandidate(
+                        foundation=parts[0].split(":",1)[1], component=int(parts[1]),
+                        protocol=parts[2], priority=int(parts[3]),
+                        ip=parts[4], port=int(parts[5]),
+                        type=parts[7], sdpMid="0", sdpMLineIndex=msg.get("mlineindex", 0))
+                    try:
+                        await pc.addIceCandidate(cand)
+                    except Exception as e:
+                        print(f"[client] ICE 添加失败: {e}")
+                else:
+                    print(f"[client] 跳过异常 ICE: {str(msg['candidate'])[:50]}")
 
     sig_task = asyncio.ensure_future(signaling())
     await asyncio.sleep(DURATION)
