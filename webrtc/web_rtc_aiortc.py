@@ -36,9 +36,10 @@ from yolo_detect import YoloDetector
 # 通过 PUT /fisheye.json 或直接改这里调整
 FISHEYE = {
     "enabled": True,
-    "fx": 1000.0, "fy": 1000.0,      # 焦距（越大越"拉平"）
+    "fx": 1000.0, "fy": 1000.0,      # 相机焦距（描述鱼眼镜头）
     "cx": 1267.0, "cy": 807.0,       # 鱼眼圆中心
     "k1": -0.08, "k2": 0.02, "k3": -0.005, "k4": 0.001,  # 畸变系数（鱼眼模型）
+    "fov_scale": 0.48,               # 输出视野缩放：<1 视野更大（0.35~1.0 可调）
 }
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription, VideoStreamTrack, AudioStreamTrack
 from aiortc.mediastreams import VideoFrame, AudioFrame
@@ -75,8 +76,8 @@ class CameraTrack(VideoStreamTrack):
         self._fc = 0
         self._u_off = None
         self._v_off = None
-        self._exp = 800
-        self._gain = 128
+        self._exp = 400          # AE 初始曝光（≤486 上限，保证帧率）
+        self._gain = 800
         self._bright = 0
         self.q = queue.Queue(maxsize=2)
 
@@ -97,15 +98,27 @@ class CameraTrack(VideoStreamTrack):
                       [0, FISHEYE["fy"], FISHEYE["cy"]],
                       [0, 0, 1]], np.float32)
         D = np.array([FISHEYE["k1"], FISHEYE["k2"], FISHEYE["k3"], FISHEYE["k4"]], np.float32)
+        # newK 控制输出视野：fov_scale<1 → 焦距短 → 视野大；主点=输出中心（防偏移）
+        s = float(FISHEYE.get("fov_scale", 1.0))
+        newK = np.eye(3, dtype=np.float32)
+        newK[0, 0] = FISHEYE["fx"] * s
+        newK[1, 1] = FISHEYE["fy"] * s
+        newK[0, 2] = OUT_W / 2.0          # 输出主点=图像中心
+        newK[1, 2] = OUT_H / 2.0
         map_y = cv2.fisheye.initUndistortRectifyMap(
-            K, D, np.eye(3), K, (OUT_W, OUT_H), cv2.CV_32FC1)
+            K, D, np.eye(3), newK, (OUT_W, OUT_H), cv2.CV_32FC1)
         # UV 平面是半分辨率，K 按比例缩放
         K_uv = K.copy()
         K_uv[0, 0] /= 2; K_uv[1, 1] /= 2
         K_uv[0, 2] /= 2; K_uv[1, 2] /= 2
+        newK_uv = np.eye(3, dtype=np.float32)
+        newK_uv[0, 0] = FISHEYE["fx"] * s / 2.0
+        newK_uv[1, 1] = FISHEYE["fy"] * s / 2.0
+        newK_uv[0, 2] = OUT_W / 4.0       # UV 输出中心 (320)
+        newK_uv[1, 2] = OUT_H / 4.0       # (180)
         map_uv = cv2.fisheye.initUndistortRectifyMap(
-            K_uv, D, np.eye(3), K_uv, (OUT_W // 2, OUT_H // 2), cv2.CV_32FC1)
-        print(f"[cam] 鱼眼去畸变已启用 (fx={FISHEYE['fx']:.0f} cx={FISHEYE['cx']:.0f} cy={FISHEYE['cy']:.0f})", flush=True)
+            K_uv, D, np.eye(3), newK_uv, (OUT_W // 2, OUT_H // 2), cv2.CV_32FC1)
+        print(f"[cam] 鱼眼去畸变 (fx={FISHEYE['fx']:.0f} fov_scale={s})", flush=True)
         return map_y, map_uv
 
     def _init_hw_pipeline(self):
@@ -152,8 +165,8 @@ appsink name=sink sync=false drop=true max-buffers=3
             y_s = cv2.remap(y, self._map_y[0], self._map_y[1], cv2.INTER_LINEAR)
             u_p = uv[:, 0::2]
             v_p = uv[:, 1::2]
-            u_s = cv2.remap(u_p, self._map_uv[0], self._map_uv[1], cv2.INTER_LINEAR)
-            v_s = cv2.remap(v_p, self._map_uv[0], self._map_uv[1], cv2.INTER_LINEAR)
+            u_s = cv2.remap(u_p, self._map_uv[0], self._map_uv[1], cv2.INTER_NEAREST)
+            v_s = cv2.remap(v_p, self._map_uv[0], self._map_uv[1], cv2.INTER_NEAREST)
         else:
             y_s = cv2.resize(y, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
             u_s = cv2.resize(uv[:, 0::2], (OUT_W // 2, OUT_H // 2),
@@ -185,10 +198,18 @@ appsink name=sink sync=false drop=true max-buffers=3
                 v_s = cv2.add(v_s, off)
         return y_s.tobytes() + u_s.tobytes() + v_s.tobytes()
 
-    def _ae_adjust(self):
+    def _set_exp_gain(self):
         import subprocess as _sp
+        try:
+            _sp.run(["v4l2-ctl", "-d", "/dev/v4l-subdev3",
+                     "--set-ctrl", f"exposure={self._exp},analogue_gain={self._gain}"],
+                    capture_output=True, timeout=2)
+        except Exception:
+            pass
+
+    def _ae_adjust(self):
         TARGET, DEAD = 60.0, 5.0
-        EXP_MIN, EXP_MAX50 = 200, 972
+        EXP_MIN, EXP_MAX50 = 150, 486   # 上限486≈10ms(50Hz半周期) 防条纹且帧率~30fps
         GAIN_MIN, GAIN_MAX = 128, 1984
         err = TARGET - self._bright
         if err > DEAD:
@@ -201,12 +222,7 @@ appsink name=sink sync=false drop=true max-buffers=3
                 self._gain = max(int(self._gain / 1.2), GAIN_MIN)
             elif self._exp > EXP_MIN:
                 self._exp = max(self._exp - 80, EXP_MIN)
-        try:
-            _sp.run(["v4l2-ctl", "-d", "/dev/v4l-subdev3",
-                     "--set-ctrl", f"exposure={self._exp},analogue_gain={self._gain}"],
-                    capture_output=True, timeout=2)
-        except Exception:
-            pass
+        self._set_exp_gain()
 
     def _reinit(self):
         """重建 V4L2 采集 + gst 硬编管道（流中断恢复）"""
@@ -230,6 +246,8 @@ appsink name=sink sync=false drop=true max-buffers=3
         import time as _t
         while not self._stop:
             try:
+                if self._fc == 0:
+                    self._set_exp_gain()   # 首次强制设曝光≤上限（防残留大值拖帧率）
                 i420 = self._frame_i420()
                 if self._fc % 15 == 0:
                     self._bright = 0.7 * self._bright + 0.3 * float(
@@ -259,12 +277,8 @@ appsink name=sink sync=false drop=true max-buffers=3
                         try: self.q.get_nowait()
                         except queue.Empty: pass
                     self.q.put(h264)
-                # 每 5 帧放一帧到检测队列（I420 720p）
-                if self._fc % 5 == 0:
-                    if self.detect_q.full():
-                        try: self.detect_q.get_nowait()
-                        except queue.Empty: pass
-                    self.detect_q.put(i420)
+                # DEBUG: 检测帧队列禁用（GIL 隔离测试）
+                pass
                 self._fc += 1
                 self._fail_count = 0
             except Exception as e:
