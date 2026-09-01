@@ -102,9 +102,30 @@ class YoloDetector:
         outputs = self.rknn.inference(img)
         if self.n_output > 1:
             return self._postprocess_dfl(outputs, ratio, dw, dh)
-        else:
-            pred = outputs.reshape(15, -1).T
-            return self._postprocess_simple(pred, ratio, dw, dh)
+        # 单输出：判断是 e2e (300,6) 还是分类式 (8400,15)
+        arr = np.asarray(outputs)
+        if arr.ndim == 3 and arr.shape[2] == 6:
+            return self._postprocess_e2e(arr, ratio, dw, dh)
+        pred = arr.reshape(-1, arr.shape[-1] if arr.ndim > 1 else 15)
+        return self._postprocess_simple(pred, ratio, dw, dh)
+
+    # ---------- YOLO26 端到端（NMS-free，[1,300,6]）----------
+    def _postprocess_e2e(self, out, ratio, dw, dh):
+        preds = np.asarray(out)[0]          # (300, 6): x1,y1,x2,y2,conf,cls
+        mask = preds[:, 4] >= self.conf_thres
+        results = []
+        for row in preds[mask]:
+            x1, y1, x2, y2, conf, cls_id = row
+            results.append({
+                "class_id": int(cls_id),
+                "label": self.labels[int(cls_id)] if int(cls_id) < len(self.labels) else "?",
+                "conf": round(float(conf), 3),
+                "box": [round((float(x1) - dw) / ratio, 1),
+                        round((float(y1) - dh) / ratio, 1),
+                        round((float(x2) - dw) / ratio, 1),
+                        round((float(y2) - dh) / ratio, 1)],
+            })
+        return results
 
     # ---------- 单输出（VisDrone）----------
     def _postprocess_simple(self, pred, ratio, dw, dh):
