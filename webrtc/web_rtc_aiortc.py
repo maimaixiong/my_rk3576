@@ -635,7 +635,82 @@ class RTCServer:
         ctx.load_cert_chain(cert, key)
         return ctx
 
+    def _start_stats_loop(self):
+        """系统监控线程：每秒采集温度/CPU/GPU/NPU/帧率 → WS 推送"""
+        import time as _ts
+        def _loop():
+            while True:
+                _ts.sleep(1.0)
+                try:
+                    stats = self._collect_stats()
+                    if self.ws and self.loop:
+                        asyncio.run_coroutine_threadsafe(
+                            self._send({"type": "stats", **stats}), self.loop)
+                except Exception:
+                    pass
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def _collect_stats(self):
+        import glob
+        stats = {}
+        # 温度（6 热区）
+        temps = {}
+        for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+            try:
+                name = open(z + "/type").read().strip()
+                t = int(open(z + "/temp").read().strip()) // 1000
+                temps[name] = t
+            except Exception:
+                pass
+        stats["temps"] = temps
+        # CPU 使用率（/proc/stat 差分）
+        stats["cpu"] = self._cpu_pct()
+        # GPU/NPU 频率（近似负载）
+        stats["gpu"] = self._devfreq_pct("/sys/class/devfreq/27800000.gpu")
+        npu = glob.glob("/sys/class/devfreq/*npu*")
+        stats["npu"] = self._devfreq_pct(npu[0]) if npu else 0
+        # 帧率（CameraTrack 发送计数差分）
+        stats["fps"] = self._fps_now()
+        return stats
+
+    def _cpu_pct(self):
+        def _read():
+            with open("/proc/stat") as f:
+                l = f.readline().split()
+            return int(l[4]), sum(int(x) for x in l[1:])
+        now = _read()
+        if not hasattr(self, "_cpu_prev"):
+            self._cpu_prev = now
+            return 0
+        idle_d = now[0] - self._cpu_prev[0]
+        total_d = now[1] - self._cpu_prev[1]
+        self._cpu_prev = now
+        if total_d <= 0:
+            return 0
+        return max(0, min(100, round(100 * (1 - idle_d / total_d))))
+
+    def _devfreq_pct(self, path):
+        try:
+            cur = int(open(path + "/cur_freq").read().strip())
+            mx = int(open(path + "/max_freq").read().strip())
+            return round(100 * cur / mx) if mx else 0
+        except Exception:
+            return 0
+
+    def _fps_now(self):
+        try:
+            sent = getattr(self.track, "_sent", 0)
+            if not hasattr(self, "_sent_prev"):
+                self._sent_prev = sent
+                return 0
+            fps = sent - self._sent_prev
+            self._sent_prev = sent
+            return max(0, fps)
+        except Exception:
+            return 0
+
     async def main(self, use_https=False):
+        self._start_stats_loop()
         handler = functools.partial(StaticHandler, directory=self.webroot)
         httpd = http.server.ThreadingHTTPServer(("0.0.0.0", self.http_port), handler)
         if use_https:

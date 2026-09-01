@@ -22,6 +22,17 @@
   .meter-db { font-size:20px; font-weight:bold; color:#fff; margin-left:8px; font-family:monospace; }
   .meter-state { font-size:13px; margin-top:3px; }
   .meter-state.ok { color:#8f8; }
+  #syspanel { margin-top:12px; background:#1a1f2a; border-radius:8px; padding:10px 14px; font-size:13px; }
+  #syspanel h3 { margin:0 0 8px; font-size:14px; color:#fff; }
+  .sys-row { display:flex; justify-content:space-between; padding:2px 0; color:#bbb; }
+  .sys-row span:last-child { color:#8f8; font-family:monospace; }
+  .loadbar { height:6px; background:#222; border-radius:3px; margin:2px 0 6px; }
+  .loadbar-fill { height:100%; border-radius:3px; transition:width .5s; }
+  .loadbar-fill.low { background:#4c4; }
+  .loadbar-fill.mid { background:#fc0; }
+  .loadbar-fill.high { background:#f44; }
+  #temps { display:flex; flex-wrap:wrap; gap:4px 14px; margin:4px 0; }
+  #temps span { color:#9cf; font-family:monospace; }
   .meter-state.no { color:#f88; }
 </style>
 </head>
@@ -48,6 +59,17 @@
   </div>
   <div id="vidstate" style="font-size:13px;color:#8f8;margin-top:6px">等待视频...</div>
   <div id="detstate" style="font-size:13px;color:#f80;margin-top:4px"></div>
+  <div id="syspanel">
+    <h3>📊 系统状态 <span id="sysfps" style="float:right;color:#ff8"></span></h3>
+    <div class="sys-row"><span>🌡️ 温度</span><span id="tempavg"></span></div>
+    <div id="temps"></div>
+    <div class="sys-row"><span>⚡ CPU</span><span id="cpupct">-</span></div>
+    <div class="loadbar"><div class="loadbar-fill" id="cpubar" style="width:0%"></div></div>
+    <div class="sys-row"><span>🎮 GPU</span><span id="gpupct">-</span></div>
+    <div class="loadbar"><div class="loadbar-fill" id="gpubar" style="width:0%"></div></div>
+    <div class="sys-row"><span>🧠 NPU</span><span id="npupct">-</span></div>
+    <div class="loadbar"><div class="loadbar-fill" id="npubar" style="width:0%"></div></div>
+  </div>
   <div id="audiolvl" style="font-size:13px;color:#fc8;margin-top:6px"></div>
   <div id="info"></div>
 </div>
@@ -136,6 +158,8 @@ async function setup() {
         if (!objs.length && !st.textContent.startsWith('🔍')) {
           st.textContent = '🟢 检测运行中（当前画面未发现目标）';
         }
+      } else if (msg.type === 'stats') {
+        updateSysPanel(msg);
       } else if (msg.type === 'audio_meter') {
         // 声压仪表：-60dB 显示 0%，-6dB 显示 100%
         const pct = Math.max(0, Math.min(100, (msg.db + 60) / 54 * 100));
@@ -172,6 +196,31 @@ async function closeAll() {
   video.srcObject = null;
   audio.srcObject = null;
   setStatus('已断开');
+}
+
+// 系统监控面板更新（秒级）
+function updateSysPanel(s) {
+  document.getElementById('sysfps').textContent = '🖥️ ' + (s.fps||0) + ' fps';
+  const temps = s.temps || {};
+  const tv = document.getElementById('temps');
+  tv.innerHTML = '';
+  let sum = 0, cnt = 0;
+  for (const [k,v] of Object.entries(temps)) {
+    tv.innerHTML += '<span>' + k + ': ' + v + '°C</span>';
+    sum += v; cnt++;
+  }
+  document.getElementById('tempavg').textContent = cnt ? (sum/cnt).toFixed(0) + '°C (均)' : '-';
+  const setBar = (id, pct) => {
+    const el = document.getElementById(id);
+    el.style.width = pct + '%';
+    el.className = 'loadbar-fill ' + (pct < 50 ? 'low' : pct < 80 ? 'mid' : 'high');
+  };
+  document.getElementById('cpupct').textContent = (s.cpu||0) + '%';
+  setBar('cpubar', s.cpu||0);
+  document.getElementById('gpupct').textContent = (s.gpu||0) + '%';
+  setBar('gpubar', s.gpu||0);
+  document.getElementById('npupct').textContent = (s.npu||0) + '%';
+  setBar('npubar', s.npu||0);
 }
 
 // YOLO 检测框绘制（box 相对 1280x720 视频帧）
