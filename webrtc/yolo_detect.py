@@ -72,7 +72,7 @@ def _box_process(position):
 
 class YoloDetector:
     def __init__(self, model_path="/usr/local/bin/webrtc/yolov8s_airborne.rknn",
-                 conf_thres=0.25, iou_thres=0.45):
+                 conf_thres=0.20, iou_thres=0.45):
         from rknn_api_ctypes import RKNN
         self.rknn = RKNN()
         self.rknn.load_rknn(model_path)

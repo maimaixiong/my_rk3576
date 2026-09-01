@@ -277,8 +277,14 @@ appsink name=sink sync=false drop=true max-buffers=3
                         try: self.q.get_nowait()
                         except queue.Empty: pass
                     self.q.put(h264)
-                # DEBUG: 检测帧队列禁用（GIL 隔离测试）
-                pass
+                # 每 15 帧放一帧到检测队列（YOLO 检测帧）
+                if self._fc % 15 == 0:
+                    if self.detect_q.full():
+                        try: self.detect_q.get_nowait()
+                        except queue.Empty: pass
+                    self.detect_q.put(i420)
+                    if self._fc % 60 == 0:
+                        print(f"[cam] 检测队列已喂帧 (fc={self._fc})", flush=True)
                 self._fc += 1
                 self._fail_count = 0
             except Exception as e:
@@ -562,6 +568,11 @@ class RTCServer:
                     _tw.sleep(0.2)
                     continue
                 i420 = q.get(timeout=1.0)
+                if not hasattr(self, "_dq"):
+                    self._dq = 0
+                self._dq += 1
+                if self._dq % 5 == 1:
+                    print(f"[yolo] 检测线程拿到帧 #{self._dq}", flush=True)
             except queue.Empty:
                 continue
             try:
@@ -576,6 +587,10 @@ class RTCServer:
                 if objs:
                     print(f"[yolo] {len(objs)} 个目标 ({det_ms}ms): " +
                           ", ".join(f"{o['label']}:{o['conf']}" for o in objs[:4]), flush=True)
+                else:
+                    self._dq = getattr(self, "_dq", 0) + 1
+                    if self._dq % 8 == 1:
+                        print(f"[yolo] 检测中… 0 目标 ({det_ms}ms)", flush=True)
                 if self.ws and self.loop:
                     asyncio.run_coroutine_threadsafe(
                         self._send({"type": "detect", "objects": objs}),
