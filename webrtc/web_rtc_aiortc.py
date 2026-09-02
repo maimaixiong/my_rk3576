@@ -106,7 +106,7 @@ class CameraTrack(VideoStreamTrack):
         newK[0, 2] = OUT_W / 2.0          # 输出主点=图像中心
         newK[1, 2] = OUT_H / 2.0
         map_y = cv2.fisheye.initUndistortRectifyMap(
-            K, D, np.eye(3), newK, (OUT_W, OUT_H), cv2.CV_32FC1)
+            K, D, np.eye(3), newK, (OUT_W, OUT_H), cv2.CV_16SC2)
         # UV 平面是半分辨率，K 按比例缩放
         K_uv = K.copy()
         K_uv[0, 0] /= 2; K_uv[1, 1] /= 2
@@ -117,7 +117,7 @@ class CameraTrack(VideoStreamTrack):
         newK_uv[0, 2] = OUT_W / 4.0       # UV 输出中心 (320)
         newK_uv[1, 2] = OUT_H / 4.0       # (180)
         map_uv = cv2.fisheye.initUndistortRectifyMap(
-            K_uv, D, np.eye(3), newK_uv, (OUT_W // 2, OUT_H // 2), cv2.CV_32FC1)
+            K_uv, D, np.eye(3), newK_uv, (OUT_W // 2, OUT_H // 2), cv2.CV_16SC2)
         print(f"[cam] 鱼眼去畸变 (fx={FISHEYE['fx']:.0f} fov_scale={s})", flush=True)
         return map_y, map_uv
 
@@ -126,7 +126,7 @@ class CameraTrack(VideoStreamTrack):
         pipe_str = f"""
 appsrc name=src format=time is-live=true max-buffers=4 !
 video/x-raw,format=I420,width={OUT_W},height={OUT_H},framerate=30/1 !
-mpph264enc rc-mode=cbr qp-init=24 profile=baseline level=31 gop=30 header-mode=each-idr !
+mpph264enc rc-mode=cbr qp-init=28 profile=baseline level=31 gop=30 header-mode=each-idr !
 h264parse !
 appsink name=sink sync=false drop=true max-buffers=3
 """
@@ -154,9 +154,10 @@ appsink name=sink sync=false drop=true max-buffers=3
         except Exception:
             pass
 
-    def _frame_i420(self):
-        """V4L2 抓帧 + cv2 缩放 + AWB → I420 bytes（cv2 释放 GIL）"""
-        data = self.cap.grab()
+    def _frame_i420(self, data=None):
+        """NV12 原始帧 + 鱼眼去畸变 + AWB → I420 bytes"""
+        if data is None:
+            data = self.cap.grab()
         y = np.frombuffer(data[:SRC_W * SRC_H], np.uint8).reshape(SRC_H, SRC_W)
         uv = np.frombuffer(data[SRC_W * SRC_H:], np.uint8).reshape(SRC_H // 2, SRC_W)
 
