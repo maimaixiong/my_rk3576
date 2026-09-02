@@ -30,7 +30,6 @@ import av
 import numpy as np
 import cv2
 import json as _json
-from yolo_detect import YoloDetector
 
 # ===== 鱼眼去畸变参数（可调；用 cv2.fisheye 模型） =====
 # 通过 PUT /fisheye.json 或直接改这里调整
@@ -106,7 +105,7 @@ class CameraTrack(VideoStreamTrack):
         newK[0, 2] = OUT_W / 2.0          # 输出主点=图像中心
         newK[1, 2] = OUT_H / 2.0
         map_y = cv2.fisheye.initUndistortRectifyMap(
-            K, D, np.eye(3), newK, (OUT_W, OUT_H), cv2.CV_16SC2)
+            K, D, np.eye(3), newK, (OUT_W, OUT_H), cv2.CV_32FC1)
         # UV 平面是半分辨率，K 按比例缩放
         K_uv = K.copy()
         K_uv[0, 0] /= 2; K_uv[1, 1] /= 2
@@ -117,7 +116,7 @@ class CameraTrack(VideoStreamTrack):
         newK_uv[0, 2] = OUT_W / 4.0       # UV 输出中心 (320)
         newK_uv[1, 2] = OUT_H / 4.0       # (180)
         map_uv = cv2.fisheye.initUndistortRectifyMap(
-            K_uv, D, np.eye(3), newK_uv, (OUT_W // 2, OUT_H // 2), cv2.CV_16SC2)
+            K_uv, D, np.eye(3), newK_uv, (OUT_W // 2, OUT_H // 2), cv2.CV_32FC1)
         print(f"[cam] 鱼眼去畸变 (fx={FISHEYE['fx']:.0f} fov_scale={s})", flush=True)
         return map_y, map_uv
 
@@ -126,7 +125,7 @@ class CameraTrack(VideoStreamTrack):
         pipe_str = f"""
 appsrc name=src format=time is-live=true max-buffers=4 !
 video/x-raw,format=I420,width={OUT_W},height={OUT_H},framerate=30/1 !
-mpph264enc rc-mode=cbr qp-init=28 profile=baseline level=31 gop=30 header-mode=each-idr !
+mpph264enc rc-mode=cbr qp-init=24 profile=baseline level=31 gop=30 header-mode=each-idr !
 h264parse !
 appsink name=sink sync=false drop=true max-buffers=3
 """
@@ -139,7 +138,6 @@ appsink name=sink sync=false drop=true max-buffers=3
     def _start_enc_thread(self):
         self._fail_count = 0
         self._stop = False
-        self.detect_q = queue.Queue(maxsize=1)   # YOLO 检测帧队列
         threading.Thread(target=self._enc_loop, daemon=True).start()
 
     def close(self):
@@ -154,10 +152,9 @@ appsink name=sink sync=false drop=true max-buffers=3
         except Exception:
             pass
 
-    def _frame_i420(self, data=None):
-        """NV12 原始帧 + 鱼眼去畸变 + AWB → I420 bytes"""
-        if data is None:
-            data = self.cap.grab()
+    def _frame_i420(self):
+        """V4L2 抓帧 + cv2 缩放 + AWB → I420 bytes（cv2 释放 GIL）"""
+        data = self.cap.grab()
         y = np.frombuffer(data[:SRC_W * SRC_H], np.uint8).reshape(SRC_H, SRC_W)
         uv = np.frombuffer(data[SRC_W * SRC_H:], np.uint8).reshape(SRC_H // 2, SRC_W)
 
@@ -278,14 +275,15 @@ appsink name=sink sync=false drop=true max-buffers=3
                         try: self.q.get_nowait()
                         except queue.Empty: pass
                     self.q.put(h264)
-                # 每 15 帧放一帧到检测队列（YOLO 检测帧）
+                # 每 15 帧写帧到 /dev/shm（独立 YOLO 进程读取）
                 if self._fc % 15 == 0:
-                    if self.detect_q.full():
-                        try: self.detect_q.get_nowait()
-                        except queue.Empty: pass
-                    self.detect_q.put(i420)
-                    if self._fc % 60 == 0:
-                        print(f"[cam] 检测队列已喂帧 (fc={self._fc})", flush=True)
+                    try:
+                        fp = "/dev/shm/camframe.yuv"
+                        with open(fp + ".tmp", "wb") as f:
+                            f.write(i420)
+                        os.rename(fp + ".tmp", fp)
+                    except Exception:
+                        pass
                 self._fc += 1
                 self._fail_count = 0
             except Exception as e:
@@ -387,8 +385,7 @@ class RTCServer:
         self.pc = None
         self.ws = None
         self.loop = None
-        self.detector = None
-        self.det_thread = None
+        self.yolo_proc = None
 
     # ---------- aiortc 信令 ----------
     async def ws_handler(self, websocket):
@@ -492,12 +489,6 @@ class RTCServer:
             raise
         self.track = CameraTrack(self.cap)
         self.pc.addTrack(self.track)
-        # 启动 YOLO 检测线程（detector 在线程内延迟初始化，不阻塞 offer）
-        # 启动 YOLO 检测线程（detector 在线程内延迟初始化，不阻塞 offer）
-        if self.det_thread is None or not self.det_thread.is_alive():
-            self.det_thread = threading.Thread(target=self._detect_loop, daemon=True)
-            self.det_thread.start()
-            print("[yolo] 检测线程已启动", flush=True)
         # 音频轨（ES8388 麦克风），带电平检测回调
         self.mic = MicTrack(on_level=self._audio_level)
         self.pc.addTrack(self.mic)
@@ -550,55 +541,6 @@ class RTCServer:
             else:
                 print(f"[rtc] 跳过异常 ICE: {str(candidate)[:60]}")
 
-    def _detect_loop(self):
-        """YOLO 检测循环：从队列拿帧 → 检测 → WS 发送结果"""
-        import time as _t
-        # 线程内初始化（30MB 模型加载 ~1s，不阻塞主流程）
-        try:
-            self.detector = YoloDetector(
-                os.path.join(self.webroot, "yolo11n_coco.rknn"))
-            print("[yolo] 检测器就绪", flush=True)
-        except Exception as e:
-            print(f"[yolo] 检测器初始化失败: {e}", flush=True)
-            self.detector = None
-        while True:
-            try:
-                q = getattr(self.track, "detect_q", None)
-                if q is None:
-                    import time as _tw
-                    _tw.sleep(0.2)
-                    continue
-                i420 = q.get(timeout=1.0)
-                if not hasattr(self, "_dq"):
-                    self._dq = 0
-                self._dq += 1
-                if self._dq % 5 == 1:
-                    print(f"[yolo] 检测线程拿到帧 #{self._dq}", flush=True)
-            except queue.Empty:
-                continue
-            try:
-                # I420 → BGR
-                img = cv2.cvtColor(
-                    np.frombuffer(i420, np.uint8).reshape(
-                        OUT_H * 3 // 2, OUT_W),
-                    cv2.COLOR_YUV2BGR_I420)
-                t0 = _t.time()
-                objs = self.detector.detect(img)
-                det_ms = int((_t.time() - t0) * 1000)
-                if objs:
-                    print(f"[yolo] {len(objs)} 个目标 ({det_ms}ms): " +
-                          ", ".join(f"{o['label']}:{o['conf']}" for o in objs[:4]), flush=True)
-                else:
-                    self._dq = getattr(self, "_dq", 0) + 1
-                    if self._dq % 8 == 1:
-                        print(f"[yolo] 检测中… 0 目标 ({det_ms}ms)", flush=True)
-                if self.ws and self.loop:
-                    asyncio.run_coroutine_threadsafe(
-                        self._send({"type": "detect", "objects": objs}),
-                        self.loop)
-            except Exception as e:
-                print(f"[yolo] 检测错误: {e}", flush=True)
-
     def _audio_level(self, rms):
         """声压回调：RMS → dBFS，推给浏览器显示"""
         import math
@@ -647,6 +589,18 @@ class RTCServer:
                     if self.ws and self.loop:
                         asyncio.run_coroutine_threadsafe(
                             self._send({"type": "stats", **stats}), self.loop)
+                    try:
+                        rp = "/dev/shm/detect.json"
+                        mt = os.path.getmtime(rp)
+                        if mt != getattr(self, "_det_mt", -1):
+                            self._det_mt = mt
+                            with open(rp) as f:
+                                d = json.load(f)
+                            asyncio.run_coroutine_threadsafe(
+                                self._send({"type": "detect",
+                                            "objects": d.get("objects", [])}), self.loop)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         threading.Thread(target=_loop, daemon=True).start()
@@ -710,8 +664,20 @@ class RTCServer:
         except Exception:
             return 0
 
+    def _start_yolo_proc(self):
+        try:
+            script = os.path.join(self.webroot, "yolo_proc.py")
+            self.yolo_proc = subprocess.Popen(
+                ["python3", "-u", script],
+                stdout=open("/tmp/yolo_proc.log", "a"),
+                stderr=subprocess.STDOUT)
+            print(f"[yolo] 检测进程已启动 PID={self.yolo_proc.pid}", flush=True)
+        except Exception as e:
+            print(f"[yolo] 检测进程启动失败: {e}", flush=True)
+
     async def main(self, use_https=False):
         self._start_stats_loop()
+        self._start_yolo_proc()
         handler = functools.partial(StaticHandler, directory=self.webroot)
         httpd = http.server.ThreadingHTTPServer(("0.0.0.0", self.http_port), handler)
         if use_https:
