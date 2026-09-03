@@ -154,8 +154,10 @@ async function setup() {
     };
 
     const host = location.hostname || location.host;
-    const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
-    ws = new WebSocket(`${wsProto}://${host}:8081`);
+    const isHttps = location.protocol === 'https:';
+    const wsProto = isHttps ? 'wss' : 'ws';
+    const wsPort = isHttps ? 8084 : 8081;
+    ws = new WebSocket(`${wsProto}://${host}:${wsPort}`);
     ws.onopen = () => { setStatus('信令已连接，等待 offer...'); send({type:'join'}); };
     ws.onmessage = async ev => {
       const msg = JSON.parse(ev.data);
@@ -300,6 +302,10 @@ let mediaRec = null, voiceChunks = [], voiceStream = null, recT0 = null;
 const VAD_TIMEOUT = 12; // 最长录音秒
 
 async function startVoice(btn) {
+  if (location.protocol !== 'https:') {
+    addChat('AI', '(语音需 HTTPS：请访问 https://192.168.2.100:8443 并允许证书)');
+    return;
+  }
   if (!navigator.mediaDevices || !window.MediaRecorder) {
     addChat('AI', '(浏览器不支持录音，需 HTTPS + Chrome/Edge)');
     return;

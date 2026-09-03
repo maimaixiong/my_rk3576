@@ -666,10 +666,20 @@ class RTCServer:
             except Exception as e:
                 print(f"[ws] 发送失败: {e}")
 
-    async def ws_server(self, ssl_ctx=None):
+    async def ws_server(self, ssl_ctx=None, port=None):
         self.loop = asyncio.get_event_loop()   # 供其他线程 WS 发送
-        async with websockets.serve(self.ws_handler, "0.0.0.0", self.ws_port, ssl=ssl_ctx):
-            print(f"[wss] 信令服务器 0.0.0.0:{self.ws_port}")
+        p = port or self.ws_port
+        async with websockets.serve(self.ws_handler, "0.0.0.0", p, ssl=ssl_ctx):
+            print(f"[{'wss' if ssl_ctx else 'ws'}] 信令服务器 0.0.0.0:{p}")
+            await asyncio.Future()
+
+    async def ws_server_dual(self, ssl_ctx):
+        """同时监听 ws:8081 和 wss:8084"""
+        self.loop = asyncio.get_event_loop()
+        wss_port = self.http_port + 4   # 8084
+        async with websockets.serve(self.ws_handler, "0.0.0.0", self.ws_port, ssl=None), \
+                   websockets.serve(self.ws_handler, "0.0.0.0", wss_port, ssl=ssl_ctx):
+            print(f"[ws] 信令 :{self.ws_port}  [wss] 信令 :{wss_port}")
             await asyncio.Future()
 
     # ---------- 主入口 ----------
@@ -785,15 +795,23 @@ class RTCServer:
     async def main(self, use_https=False):
         self._start_stats_loop()
         self._start_yolo_proc()
+        ctx = self._ssl_ctx()
         handler = functools.partial(StaticHandler, directory=self.webroot)
+        # HTTP :8080（视频/聊天/监控——无需证书）
         httpd = http.server.ThreadingHTTPServer(("0.0.0.0", self.http_port), handler)
-        if use_https:
-            ctx = self._ssl_ctx()
-            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        print(f"[{'https' if use_https else 'http'}] 页面服务器 {'https' if use_https else 'http'}://0.0.0.0:{self.http_port}")
+        print(f"[http] 页面 http://0.0.0.0:{self.http_port}")
 
-        await self.ws_server(self._ssl_ctx() if use_https else None)
+        if use_https:
+            # 额外 HTTPS :8443（语音 mic 授权）
+            https_port = 8443
+            hd = http.server.ThreadingHTTPServer(("0.0.0.0", https_port), handler)
+            hd.socket = ctx.wrap_socket(hd.socket, server_side=True)
+            threading.Thread(target=hd.serve_forever, daemon=True).start()
+            print(f"[https] 语音页面 https://0.0.0.0:{https_port}")
+            await self.ws_server_dual(ctx)
+        else:
+            await self.ws_server()
 
 
 if __name__ == "__main__":
