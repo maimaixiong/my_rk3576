@@ -17,3 +17,4 @@ __pycache__/
 .idea/
 models/*.gguf
 models/whisper-base/
+models/whisper-small/

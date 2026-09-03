@@ -399,7 +399,8 @@ class RTCServer:
                 if t == "join":
                     await self.handle_join()
                 elif t == "voice":
-                    asyncio.ensure_future(self.handle_voice(msg.get("audio", "")))
+                    asyncio.ensure_future(self.handle_voice(msg.get("audio", ""),
+                                                            msg.get("seq", 0)))
                 elif t == "chat":
                     asyncio.ensure_future(self.handle_chat(msg.get("text", "")))
                 elif t == "answer":
@@ -559,7 +560,7 @@ class RTCServer:
             print("[voice] whisper 就绪", flush=True)
         return self._whisper
 
-    async def handle_voice(self, audio_b64):
+    async def handle_voice(self, audio_b64, seq=0):
         """语音命令：base64 WAV → whisper STT → Agent 回答"""
         if not audio_b64:
             return
@@ -572,10 +573,12 @@ class RTCServer:
             # 浏览器 MediaRecorder 输出 webm → ffmpeg 转 16k mono wav
             wav16 = "/tmp/voice_cmd16.wav"
             subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", wf,
-                            "-ar", "16000", "-ac", "1", wav16],
+                            "-af", "loudnorm=I=-16:TP=-1.5",
+                            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav16],
                            capture_output=True, timeout=30)
             model = self._get_whisper()
-            segments, _ = model.transcribe(wav16, language="zh")
+            segments, _ = model.transcribe(wav16, language="zh",
+                                            beam_size=5)
             return "".join(s.text for s in segments).strip()
 
         try:
@@ -586,6 +589,9 @@ class RTCServer:
                                       "text": "(未听清，请再说一遍)"})
                 return
             print(f"[voice] 听写: {text}", flush=True)
+            # 识别文本回显（页面更新用户消息）
+            if self.ws:
+                await self._send({"type": "voice_text", "text": text, "seq": seq})
             # 走 Agent 对话链路
             await self.handle_chat(text)
         except Exception as e:

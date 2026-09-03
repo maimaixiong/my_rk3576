@@ -69,7 +69,13 @@
   <div id="vidstate" style="font-size:13px;color:#8f8;margin-top:6px">等待视频...</div>
   <div id="detstate" style="font-size:13px;color:#f80;margin-top:4px"></div>
   <div id="chatpanel">
-    <h3>💬 问设备（AI Agent） <button id="voicebtn" onclick="startVoice(this)" style="padding:4px 10px;border:0;border-radius:6px;background:#c30;color:#fff;cursor:pointer">🎤 按住说话</button></h3>
+    <h3>💬 问设备（AI Agent）
+      <button id="voicebtn" onclick="startVoice(this)" style="padding:4px 10px;border:0;border-radius:6px;background:#c30;color:#fff;cursor:pointer">🎤 按住说话</button>
+      <div id="voicelevel" style="display:inline-block;width:100px;height:10px;background:#222;border-radius:5px;margin-left:8px;vertical-align:middle;overflow:hidden">
+        <div id="voicelevelfill" style="width:0%;height:100%;background:linear-gradient(90deg,#4c4,#fc0,#f44)"></div>
+      </div>
+      <span id="voicestate" style="font-size:11px;color:#999"></span>
+    </h3>
     <div id="chatlog"></div>
     <div id="chatinput">
       <input id="chattext" placeholder="问设备：画面里有什么？设备温度？" onkeydown="if(event.key==='Enter')sendChat()">
@@ -179,6 +185,14 @@ async function setup() {
         }
       } else if (msg.type === 'stats') {
         updateSysPanel(msg);
+      } else if (msg.type === 'voice_text') {
+        // 精确更新语音占位为识别文本
+        if (voiceUserDiv) {
+          voiceUserDiv.textContent = '🎤 ' + msg.text;
+          voiceUserDiv.className = 'user';
+          voiceUserDiv = null;
+        }
+        addChat('AI', '(思考中…)');
       } else if (msg.type === 'chat_reply') {
         // 移除"思考中"占位再显示回复
         const last = chatlog.lastElementChild;
@@ -284,6 +298,7 @@ function addChat(role, text) {
   d.textContent = (role === 'AI' ? '🤖 ' : '🧑 ') + text;
   chatlog.appendChild(d);
   chatlog.scrollTop = chatlog.scrollHeight;
+  return d;   // 返回元素（语音占位更新用）
 }
 function sendChat() {
   const inp = document.getElementById('chattext');
@@ -297,11 +312,14 @@ function sendChat() {
 }
 // 移除"思考中"占位（简单处理：chat_reply 直接追加，占位保留作为 loading）
 
-// 语音功能：按住录音 → WS 发送 → 板子 whisper STT → Agent
-let mediaRec = null, voiceChunks = [], voiceStream = null, recT0 = null;
-const VAD_TIMEOUT = 12; // 最长录音秒
+// 语音功能：按住录音（防重复 + 声压指示）→ WS → 板子 STT → Agent
+let mediaRec = null, voiceChunks = [], voiceStream = null;
+let voiceActive = false, voiceSeq = 0, voiceUserDiv = null;
+let voiceAnalyser = null, voiceCtx = null, voiceLevelTimer = null;
+const VAD_TIMEOUT = 12;
 
 async function startVoice(btn) {
+  if (voiceActive) return;   // 防重复启动
   if (location.protocol !== 'https:') {
     addChat('AI', '(语音需 HTTPS：请访问 https://192.168.2.100:8443 并允许证书)');
     return;
@@ -312,36 +330,72 @@ async function startVoice(btn) {
   }
   try {
     voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    voiceActive = true;
     mediaRec = new MediaRecorder(voiceStream);
     voiceChunks = [];
     mediaRec.ondataavailable = e => voiceChunks.push(e.data);
-    mediaRec.onstop = async () => {
-      voiceStream.getTracks().forEach(t => t.stop());
-      const blob = new Blob(voiceChunks, { type: 'audio/webm' });
-      // 转 16k mono wav（简单：直接发 webm，板子用 ffmpeg 转）
-      const reader = new FileReader();
-      reader.onload = async () => {
-        send({ type: 'voice', audio: reader.result.split(',')[1] });
-        addChat('user', '🎤 (语音命令)');
-        addChat('AI', '(识别中…)');
-      };
-      reader.readAsDataURL(blob);
-    };
+    mediaRec.onstop = handleVoiceStop;
     mediaRec.start();
+    startVoiceLevel();
     btn.textContent = '🔴 松开发送';
     btn.style.background = '#f00';
+    document.getElementById('voicestate').textContent = '● 录音中';
     btn.onmouseup = btn.ontouchend = () => stopVoice(btn);
-    btn.onmouseleave = null;
-    setTimeout(() => { if (mediaRec && mediaRec.state === 'recording') stopVoice(btn); }, VAD_TIMEOUT * 1000);
+    setTimeout(() => { if (voiceActive) stopVoice(btn); }, VAD_TIMEOUT * 1000);
   } catch (e) {
-    addChat('AI', '(麦克风授权失败: ' + e.message + ' — 需 HTTPS 访问)');
+    addChat('AI', '(麦克风授权失败: ' + e.message + ')');
   }
 }
+
 function stopVoice(btn) {
-  if (mediaRec && mediaRec.state === 'recording') mediaRec.stop();
+  if (!voiceActive) return;   // 防重复停止（mouseup+touchend 双触发）
+  if (mediaRec && mediaRec.state === 'recording') mediaRec.stop();  // onstop 会调 handleVoiceStop
+}
+
+function handleVoiceStop() {
+  if (!voiceActive) return;
+  voiceActive = false;
+  stopVoiceLevel();
+  if (voiceStream) voiceStream.getTracks().forEach(t => t.stop());
+  const btn = document.getElementById('voicebtn');
   btn.textContent = '🎤 按住说话';
   btn.style.background = '#c30';
   btn.onmouseup = btn.ontouchend = null;
+  document.getElementById('voicestate').textContent = '';
+  const blob = new Blob(voiceChunks, { type: 'audio/webm' });
+  const reader = new FileReader();
+  reader.onload = () => {
+    voiceSeq++;
+    const seq = voiceSeq;
+    send({ type: 'voice', audio: reader.result.split(',')[1], seq: seq });
+    // 用户消息占位（精确更新用）
+    voiceUserDiv = addChat('user', '🎤 (语音识别中…)');
+    addChat('AI', '(思考中…)');
+  };
+  reader.readAsDataURL(blob);
+}
+
+// 声压指示（录音时实时）
+function startVoiceLevel() {
+  voiceCtx = new (window.AudioContext || window.webkitAudioContext)();
+  voiceAnalyser = voiceCtx.createAnalyser();
+  voiceAnalyser.fftSize = 512;
+  voiceCtx.createMediaStreamSource(voiceStream).connect(voiceAnalyser);
+  const data = new Uint8Array(voiceAnalyser.frequencyBinCount);
+  voiceLevelTimer = setInterval(() => {
+    voiceAnalyser.getByteTimeDomainData(data);
+    let peak = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = Math.abs(data[i] - 128) / 128;
+      if (v > peak) peak = v;
+    }
+    document.getElementById('voicelevelfill').style.width = (peak * 100) + '%';
+  }, 100);
+}
+function stopVoiceLevel() {
+  if (voiceLevelTimer) clearInterval(voiceLevelTimer);
+  if (voiceCtx) voiceCtx.close();
+  document.getElementById('voicelevelfill').style.width = '0%';
 }
 
 // Mac Speaker TTS
