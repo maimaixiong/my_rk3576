@@ -22,6 +22,15 @@
   .meter-db { font-size:20px; font-weight:bold; color:#fff; margin-left:8px; font-family:monospace; }
   .meter-state { font-size:13px; margin-top:3px; }
   .meter-state.ok { color:#8f8; }
+  #chatpanel { margin-top:12px; background:#1a1f2a; border-radius:8px; padding:10px 14px; }
+  #chatpanel h3 { margin:0 0 8px; font-size:14px; color:#fff; }
+  #chatlog { height:180px; overflow-y:auto; font-size:13px; color:#ddd; margin-bottom:8px; padding:4px; background:#141820; border-radius:6px; }
+  #chatlog .user { color:#8cf; }
+  #chatlog .ai { color:#8f8; }
+  #chatlog .meta { color:#666; font-size:11px; }
+  #chatinput { display:flex; gap:6px; }
+  #chattext { flex:1; padding:6px; border-radius:6px; border:0; background:#222; color:#fff; }
+  #chatsend { padding:6px 14px; border:0; border-radius:6px; background:#2a6; color:#fff; cursor:pointer; }
   #syspanel { margin-top:12px; background:#1a1f2a; border-radius:8px; padding:10px 14px; font-size:13px; }
   #syspanel h3 { margin:0 0 8px; font-size:14px; color:#fff; }
   .sys-row { display:flex; justify-content:space-between; padding:2px 0; color:#bbb; }
@@ -59,6 +68,14 @@
   </div>
   <div id="vidstate" style="font-size:13px;color:#8f8;margin-top:6px">等待视频...</div>
   <div id="detstate" style="font-size:13px;color:#f80;margin-top:4px"></div>
+  <div id="chatpanel">
+    <h3>💬 问设备（AI Agent，参考 CarWatch）</h3>
+    <div id="chatlog"></div>
+    <div id="chatinput">
+      <input id="chattext" placeholder="问设备：画面里有什么？设备温度？" onkeydown="if(event.key==='Enter')sendChat()">
+      <button id="chatsend" onclick="sendChat()">发送</button>
+    </div>
+  </div>
   <div id="syspanel">
     <h3>📊 系统状态 <span id="sysfps" style="float:right;color:#ff8"></span></h3>
     <div class="sys-row"><span>🌡️ 温度</span><span id="tempavg"></span></div>
@@ -160,6 +177,11 @@ async function setup() {
         }
       } else if (msg.type === 'stats') {
         updateSysPanel(msg);
+      } else if (msg.type === 'chat_reply') {
+        // 移除"思考中"占位再显示回复
+        const last = chatlog.lastElementChild;
+        if (last && last.textContent.includes('思考中')) last.remove();
+        addChat('AI', msg.text || '');
       } else if (msg.type === 'audio_meter') {
         // 声压仪表：-60dB 显示 0%，-6dB 显示 100%
         const pct = Math.max(0, Math.min(100, (msg.db + 60) / 54 * 100));
@@ -249,6 +271,27 @@ function drawDetections(objs) {
   });
 }
 setInterval(() => { ovl.width = ovl.width; }, 1000);  // 防残留
+
+// 对话功能（参考 CarWatch 的 ask 模式）
+const chatlog = document.getElementById('chatlog');
+function addChat(role, text) {
+  const d = document.createElement('div');
+  d.className = role === 'AI' ? 'ai' : 'user';
+  d.textContent = (role === 'AI' ? '🤖 ' : '🧑 ') + text;
+  chatlog.appendChild(d);
+  chatlog.scrollTop = chatlog.scrollHeight;
+}
+function sendChat() {
+  const inp = document.getElementById('chattext');
+  const t = inp.value.trim();
+  if (!t) return;
+  addChat('user', t);
+  inp.value = '';
+  addChat('AI', '(思考中…)');
+  send({ type: 'chat', text: t });
+  // 简单滚动：最后一条等待替换——这里简化，AI 回复走 chat_reply 追加
+}
+// 移除"思考中"占位（简单处理：chat_reply 直接追加，占位保留作为 loading）
 
 // Web Audio 播放电平分析
 let audioCtx = null, analyser = null;

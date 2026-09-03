@@ -398,6 +398,8 @@ class RTCServer:
                 print(f"[ws] 消息: {t}")
                 if t == "join":
                     await self.handle_join()
+                elif t == "chat":
+                    asyncio.ensure_future(self.handle_chat(msg.get("text", "")))
                 elif t == "answer":
                     await self.handle_answer(msg["sdp"])
                 elif t == "ice":
@@ -519,6 +521,64 @@ class RTCServer:
         n_cands = len([l for l in sdp_send.splitlines() if "candidate" in l])
         print(f"[rtc] offer 生成 ({len(sdp_send)} 字节, 候选 {n_cands} 条)")
         await self._send({"type": "offer", "sdp": sdp_send})
+
+    def _get_scene(self):
+        """收集当前感知（YOLO + 系统状态）→ 场景描述"""
+        parts = []
+        try:
+            with open("/dev/shm/detect.json") as f:
+                d = json.load(f)
+            objs = d.get("objects", [])
+            if objs:
+                names = {}
+                for o in objs:
+                    names[o["label"]] = names.get(o["label"], 0) + 1
+                parts.append("摄像头画面检测到: " + ", ".join(f"{k} x{v}" for k, v in names.items()))
+            else:
+                parts.append("摄像头画面中未检测到目标")
+        except Exception:
+            parts.append("摄像头检测数据暂不可用")
+        try:
+            with open("/dev/shm/detect.json") as f:
+                d = json.load(f)
+            parts.append(f"检测耗时 {d.get('det_ms', '?')}ms")
+        except Exception:
+            pass
+        return "；".join(parts)
+
+    async def handle_chat(self, text):
+        """对话：注入感知 → LLM 回答"""
+        if not text.strip():
+            return
+        scene = self._get_scene()
+        sys_state = ""
+        try:
+            st = self._collect_stats()
+            temps = st.get("temps", {})
+            sys_state = f"系统: CPU {st.get('cpu',0)}%, NPU {st.get('npu',0)}%, 温度 {max(temps.values()) if temps else '?'}°C, 帧率 {st.get('fps',0)}fps"
+        except Exception:
+            pass
+
+        prompt = ("你是运行在 RK3576 边缘设备上的智能助手。"
+                  "请基于以下设备真实感知回答，简洁（3句内），不要编造未给出的数据。\n"
+                  f"感知: {scene}；{sys_state}\n"
+                  f"用户: {text}\n助手: ")
+
+        def _ask():
+            import urllib.request
+            req = urllib.request.Request(
+                "http://127.0.0.1:8082/completion",
+                data=json.dumps({"prompt": prompt, "n_predict": 120}).encode())
+            r = json.loads(urllib.request.urlopen(req, timeout=90).read())
+            return r.get("content", "").strip()
+
+        try:
+            reply = await asyncio.get_event_loop().run_in_executor(None, _ask)
+        except Exception as e:
+            reply = f"(LLM 服务不可用: {e})"
+        print(f"[chat] Q: {text[:50]} → A: {reply[:60]}", flush=True)
+        if self.ws:
+            await self._send({"type": "chat_reply", "text": reply})
 
     async def handle_answer(self, sdp):
         if self.pc:
