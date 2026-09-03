@@ -568,7 +568,7 @@ class RTCServer:
             import urllib.request
             req = urllib.request.Request(
                 "http://127.0.0.1:8082/completion",
-                data=json.dumps({"prompt": prompt, "n_predict": 120}).encode())
+                data=json.dumps({"prompt": prompt, "n_predict": 80}).encode())
             r = json.loads(urllib.request.urlopen(req, timeout=90).read())
             return r.get("content", "").strip()
 
