@@ -398,6 +398,8 @@ class RTCServer:
                 print(f"[ws] 消息: {t}")
                 if t == "join":
                     await self.handle_join()
+                elif t == "voice":
+                    asyncio.ensure_future(self.handle_voice(msg.get("audio", "")))
                 elif t == "chat":
                     asyncio.ensure_future(self.handle_chat(msg.get("text", "")))
                 elif t == "answer":
@@ -545,6 +547,51 @@ class RTCServer:
         except Exception:
             pass
         return "；".join(parts)
+
+    def _get_whisper(self):
+        """惰性加载 whisper（首次语音时）"""
+        if not hasattr(self, "_whisper") or self._whisper is None:
+            from faster_whisper import WhisperModel
+            print("[voice] 加载 whisper...", flush=True)
+            self._whisper = WhisperModel(
+                os.path.join(self.webroot, "whisper-base"),
+                device="cpu", compute_type="int8")
+            print("[voice] whisper 就绪", flush=True)
+        return self._whisper
+
+    async def handle_voice(self, audio_b64):
+        """语音命令：base64 WAV → whisper STT → Agent 回答"""
+        if not audio_b64:
+            return
+        def _transcribe():
+            import base64 as b64
+            raw = b64.b64decode(audio_b64)
+            wf = "/tmp/voice_cmd.webm"
+            with open(wf, "wb") as f:
+                f.write(raw)
+            # 浏览器 MediaRecorder 输出 webm → ffmpeg 转 16k mono wav
+            wav16 = "/tmp/voice_cmd16.wav"
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", wf,
+                            "-ar", "16000", "-ac", "1", wav16],
+                           capture_output=True, timeout=30)
+            model = self._get_whisper()
+            segments, _ = model.transcribe(wav16, language="zh")
+            return "".join(s.text for s in segments).strip()
+
+        try:
+            text = await asyncio.get_event_loop().run_in_executor(None, _transcribe)
+            if not text:
+                if self.ws:
+                    await self._send({"type": "chat_reply",
+                                      "text": "(未听清，请再说一遍)"})
+                return
+            print(f"[voice] 听写: {text}", flush=True)
+            # 走 Agent 对话链路
+            await self.handle_chat(text)
+        except Exception as e:
+            print(f"[voice] 错误: {e}", flush=True)
+            if self.ws:
+                await self._send({"type": "chat_reply", "text": f"(语音处理失败: {e})"})
 
     async def handle_chat(self, text):
         """对话：注入感知 → LLM 回答"""

@@ -69,7 +69,7 @@
   <div id="vidstate" style="font-size:13px;color:#8f8;margin-top:6px">等待视频...</div>
   <div id="detstate" style="font-size:13px;color:#f80;margin-top:4px"></div>
   <div id="chatpanel">
-    <h3>💬 问设备（AI Agent，参考 CarWatch）</h3>
+    <h3>💬 问设备（AI Agent） <button id="voicebtn" onclick="startVoice(this)" style="padding:4px 10px;border:0;border-radius:6px;background:#c30;color:#fff;cursor:pointer">🎤 按住说话</button></h3>
     <div id="chatlog"></div>
     <div id="chatinput">
       <input id="chattext" placeholder="问设备：画面里有什么？设备温度？" onkeydown="if(event.key==='Enter')sendChat()">
@@ -182,6 +182,8 @@ async function setup() {
         const last = chatlog.lastElementChild;
         if (last && last.textContent.includes('思考中')) last.remove();
         addChat('AI', msg.text || '');
+        // 用 Mac Speaker 朗读（Web Speech API）
+        speak(msg.text || '');
       } else if (msg.type === 'audio_meter') {
         // 声压仪表：-60dB 显示 0%，-6dB 显示 100%
         const pct = Math.max(0, Math.min(100, (msg.db + 60) / 54 * 100));
@@ -292,6 +294,63 @@ function sendChat() {
   // 简单滚动：最后一条等待替换——这里简化，AI 回复走 chat_reply 追加
 }
 // 移除"思考中"占位（简单处理：chat_reply 直接追加，占位保留作为 loading）
+
+// 语音功能：按住录音 → WS 发送 → 板子 whisper STT → Agent
+let mediaRec = null, voiceChunks = [], voiceStream = null, recT0 = null;
+const VAD_TIMEOUT = 12; // 最长录音秒
+
+async function startVoice(btn) {
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    addChat('AI', '(浏览器不支持录音，需 HTTPS + Chrome/Edge)');
+    return;
+  }
+  try {
+    voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRec = new MediaRecorder(voiceStream);
+    voiceChunks = [];
+    mediaRec.ondataavailable = e => voiceChunks.push(e.data);
+    mediaRec.onstop = async () => {
+      voiceStream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(voiceChunks, { type: 'audio/webm' });
+      // 转 16k mono wav（简单：直接发 webm，板子用 ffmpeg 转）
+      const reader = new FileReader();
+      reader.onload = async () => {
+        send({ type: 'voice', audio: reader.result.split(',')[1] });
+        addChat('user', '🎤 (语音命令)');
+        addChat('AI', '(识别中…)');
+      };
+      reader.readAsDataURL(blob);
+    };
+    mediaRec.start();
+    btn.textContent = '🔴 松开发送';
+    btn.style.background = '#f00';
+    btn.onmouseup = btn.ontouchend = () => stopVoice(btn);
+    btn.onmouseleave = null;
+    setTimeout(() => { if (mediaRec && mediaRec.state === 'recording') stopVoice(btn); }, VAD_TIMEOUT * 1000);
+  } catch (e) {
+    addChat('AI', '(麦克风授权失败: ' + e.message + ' — 需 HTTPS 访问)');
+  }
+}
+function stopVoice(btn) {
+  if (mediaRec && mediaRec.state === 'recording') mediaRec.stop();
+  btn.textContent = '🎤 按住说话';
+  btn.style.background = '#c30';
+  btn.onmouseup = btn.ontouchend = null;
+}
+
+// Mac Speaker TTS
+function speak(text) {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text.replace(/[()（）：:]/g, ' '));
+  u.lang = 'zh-CN';
+  u.rate = 1.0;
+  // 选中文声音
+  const voices = window.speechSynthesis.getVoices();
+  const zh = voices.find(v => v.lang.startsWith('zh'));
+  if (zh) u.voice = zh;
+  window.speechSynthesis.speak(u);
+}
 
 // Web Audio 播放电平分析
 let audioCtx = null, analyser = null;

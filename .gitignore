@@ -16,3 +16,4 @@ __pycache__/
 .vscode/
 .idea/
 models/*.gguf
+models/whisper-base/
